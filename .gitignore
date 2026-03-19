@@ -1,13 +1,16 @@
-# Node
-node_modules/
+# backend
+/llm-chat-back/node_modules/
+/llm-chat-back/.env
+/llm-chat-back/logs/
+#/llm-chat-back/data/   필요하면 추가
 
-# Env
-.env
+# frontend
+/llm-chat/node_modules/
 
-# Logs
-logs/
+# common build outputs
+/llm-chat/dist/
+/llm-chat-back/dist/
+/build/
+
+# log files
 *.log
-
-# Build
-dist/
-build/
