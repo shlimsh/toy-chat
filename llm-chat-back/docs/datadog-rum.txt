@@ -1,2 +1,7 @@
-Datadog APM allows you to trace requests across distributed systems.
-It provides latency breakdowns and service dependencies.
+Datadog APM(애플리케이션 성능 모니터링)을 이용하면 애플리케이션을 더욱 상세히 가시화할 수 있어 성능 병목 현상을 파악하고, 오류를 트러블슈팅하고, 서비스를 최적화할 수 있습니다.
+
+이 가이드에서는 APM을 시작해 Datadog로 첫 트레이스를 전송하는 방법을 설명합니다.
+
+Datadog APM을 설정해 Datadog로 트레이스를 보낼 수 있습니다.
+애플리케이션을 실행해 데이터를 생성합니다.
+Datadog에서 수집한 데이터를 탐색합니다.
