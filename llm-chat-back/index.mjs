@@ -131,6 +131,34 @@ function shouldUseDocs(message) {
   return String(message ?? "").trim().length > 0;
 }
 
+function shouldForceDemoError(message) {
+  const safeMessage = String(message ?? "");
+  return (
+    safeMessage.includes("백엔드 에러 테스트") ||
+    safeMessage.includes("에러 테스트") ||
+    safeMessage.includes("error test")
+  );
+}
+
+function markSpanError(error, extraTags = {}) {
+  const span = tracer.scope().active();
+  if (!span || !error) return;
+
+  // Datadog이 인식하기 가장 좋은 방식
+  span.setTag("error", error);
+
+  // 명시적으로도 보강
+  span.setTag("error.type", error.name || "Error");
+  span.setTag("error.message", error.message || "unknown error");
+  span.setTag("error.stack", error.stack || "");
+
+  for (const [key, value] of Object.entries(extraTags)) {
+    if (value !== undefined && value !== null) {
+      span.setTag(key, value);
+    }
+  }
+}
+
 /**
  * DB 헬퍼
  */
@@ -524,16 +552,34 @@ app.get("/health", (_req, res) => {
  */
 app.get("/conversations", (req, res) => {
   try {
-    const { sessionId } = req.query;
+    const { sessionId, forceError } = req.query;
 
     if (!sessionId) {
       return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    // 데모용 강제 에러
+    if (String(forceError) === "true") {
+      throw new Error("Intentional backend error for demo");
     }
 
     const conversations = getConversationsBySessionId(sessionId);
     return res.json({ conversations });
   } catch (error) {
     console.error("conversations error:", error);
+
+    logger.error("conversations_failed", {
+      session_id: req.query?.sessionId || "unknown",
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+
+    markSpanError(error, {
+      "app.feature": "conversations",
+      "app.route": "GET /conversations",
+      "app.session_id": req.query?.sessionId || "unknown",
+    });
+
     return res.status(500).json({
       error: error?.message || "internal server error",
     });
@@ -546,11 +592,30 @@ app.get("/conversations", (req, res) => {
 app.get("/conversations/:conversationId/messages", (req, res) => {
   try {
     const { conversationId } = req.params;
+    const { forceError } = req.query;
+
+    if (String(forceError) === "true") {
+      throw new Error("Intentional conversation messages error for demo");
+    }
+
     const messages = getMessagesByConversationId(conversationId);
 
     return res.json({ messages });
   } catch (error) {
     console.error("conversation messages error:", error);
+
+    logger.error("conversation_messages_failed", {
+      conversation_id: req.params?.conversationId || "unknown",
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+
+    markSpanError(error, {
+      "app.feature": "conversation_messages",
+      "app.route": "GET /conversations/:conversationId/messages",
+      "app.conversation_id": req.params?.conversationId || "unknown",
+    });
+
     return res.status(500).json({
       error: error?.message || "internal server error",
     });
@@ -562,7 +627,7 @@ app.get("/conversations/:conversationId/messages", (req, res) => {
  */
 app.post("/chat", async (req, res) => {
   try {
-    const { sessionId, conversationId, message } = req.body ?? {};
+    const { sessionId, conversationId, message, forceError } = req.body ?? {};
 
     if (!sessionId) {
       return res.status(400).json({ error: "sessionId is required" });
@@ -570,6 +635,11 @@ app.post("/chat", async (req, res) => {
 
     if (!message || !String(message).trim()) {
       return res.status(400).json({ error: "message is required" });
+    }
+
+    // 데모용 강제 에러
+    if (forceError === true || shouldForceDemoError(message)) {
+      throw new Error("Intentional backend error for demo");
     }
 
     logger.info("chat_request_started", {
@@ -598,6 +668,7 @@ app.post("/chat", async (req, res) => {
       activeSpan.setTag("app.session_id", sessionId);
       activeSpan.setTag("app.conversation_id", conversation.id);
       activeSpan.setTag("app.feature", "chat");
+      activeSpan.setTag("app.route", "POST /chat");
     }
 
     const result = await llmobs.trace(
@@ -903,10 +974,12 @@ IMPORTANT RULES:
       error_stack: error.stack,
     });
 
-    const activeSpan = tracer.scope().active();
-    if (activeSpan) {
-      activeSpan.setTag("error", error);
-    }
+    markSpanError(error, {
+      "app.feature": "chat",
+      "app.route": "POST /chat",
+      "app.session_id": req.body?.sessionId || "unknown",
+      "app.conversation_id": req.body?.conversationId || "unknown",
+    });
 
     return res.status(500).json({
       error: error?.message || "internal server error",

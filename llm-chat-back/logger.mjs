@@ -10,7 +10,10 @@ if (!fs.existsSync(logDir)) {
 
 const logger = winston.createLogger({
   level: "info",
-  format: winston.format.json(),
+  format: winston.format.combine(
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
   defaultMeta: {
     service: "shlim-toy-chat-api",
     env: process.env.DD_ENV || "dev",
