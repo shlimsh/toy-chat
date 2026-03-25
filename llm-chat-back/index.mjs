@@ -746,8 +746,33 @@ if (span) {
  * 채팅
  */
 app.post("/chat", async (req, res) => {
+  const requestSpan = tracer.scope().active();
+  const { sessionId, conversationId, message, forceError } = req.body ?? {};
+
   try {
-    const { sessionId, conversationId, message, forceError } = req.body ?? {};
+    if (forceError === true) {
+      const error = new Error("Intentional backend error for demo");
+
+      if (requestSpan) {
+        requestSpan.setTag("error", true);
+        requestSpan.setTag("error.type", error.name);
+        requestSpan.setTag("error.message", error.message);
+        requestSpan.setTag("http.status_code", 500);
+        requestSpan.setTag("app.error.handled", true);
+      }
+
+      logger.error("chat_request_failed", {
+        session_id: sessionId || "unknown",
+        conversation_id: conversationId || "unknown",
+        "http.request.body": req.body,
+        error_message: error.message,
+        error_stack: error.stack,
+      });
+
+      return res.status(500).json({
+        error: error.message,
+      });
+    }
 
     if (!sessionId) {
       return res.status(400).json({ error: "sessionId is required" });
@@ -757,15 +782,11 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "message is required" });
     }
 
-    if (forceError === true || shouldForceDemoError(message)) {
-      throw new Error("Intentional backend error for demo");
-    }
-
-logger.info("chat_request_received", {
-  session_id: sessionId,
-  conversation_id: conversationId || "new",
-  request_body: req.body,
-});
+    logger.info("chat_request_received", {
+      session_id: sessionId,
+      conversation_id: conversationId || "new",
+      request_body: req.body,
+    });
 
     let conversation;
 
@@ -1121,13 +1142,14 @@ logger.info("chat_request_success", {
       error_stack: error.stack,
     });
 
-    markSpanError(error, {
-      "app.feature": "chat",
-      "app.route": "POST /chat",
-      "app.session_id": req.body?.sessionId || "unknown",
-      "app.conversation_id": req.body?.conversationId || "unknown",
-      "http.request.body": safeStringify(req.body),
-    });
+    if (requestSpan) {
+      requestSpan.setTag("error", true);
+      requestSpan.setTag("error.type", error.name || "Error");
+      requestSpan.setTag("error.message", error.message || "unknown error");
+      requestSpan.setTag("error.stack", error.stack || "");
+      requestSpan.setTag("http.status_code", 500);
+      requestSpan.setTag("app.error.handled", true);
+    }
 
     return res.status(500).json({
       error: error?.message || "internal server error",

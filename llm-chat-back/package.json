@@ -4,7 +4,7 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
-    "dev": "node --env-file=.env --import dd-trace/initialize.mjs index.mjs"
+    "dev": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.8.0",
