@@ -1,9 +1,9 @@
 name: Datadog Static Analysis (SAST)
 
 on:
-  pull_request:
   push:
     branches:
+      - main
       - haha
 
 jobs:
@@ -13,6 +13,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
       - name: Check code meets quality standards
         id: datadog-static-analysis
         uses: DataDog/datadog-static-analyzer-github-action@v3
