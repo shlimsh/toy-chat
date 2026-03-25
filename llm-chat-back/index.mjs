@@ -16,6 +16,13 @@ import {
   cosineSimilarity,
 } from "./rag.mjs";
 
+console.log("DD_GIT_REPOSITORY_URL =", process.env.DD_GIT_REPOSITORY_URL);
+console.log("DD_GIT_COMMIT_SHA =", process.env.DD_GIT_COMMIT_SHA);
+console.log("DD_SERVICE =", process.env.DD_SERVICE);
+console.log("DD_VERSION =", process.env.DD_VERSION);
+console.log("DD_ENV =", process.env.DD_ENV);
+console.log("DD_TAGS =", process.env.DD_TAGS);
+
 const app = express();
 const llmobs = tracer.llmobs;
 const ML_APP =
@@ -140,14 +147,31 @@ function shouldForceDemoError(message) {
   );
 }
 
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return JSON.stringify({
+      stringify_error: error.message,
+    });
+  }
+}
+
+function setRequestBodyOnSpan(span, body) {
+  if (!span) return;
+span.setTag("http.request.body", safeStringify(body));
+}
+
+function setResponseBodyOnSpan(span, body) {
+  if (!span) return;
+  span.setTag("http.response.body", safeStringify(body));
+}
+
 function markSpanError(error, extraTags = {}) {
   const span = tracer.scope().active();
   if (!span || !error) return;
 
-  // Datadog이 인식하기 가장 좋은 방식
   span.setTag("error", error);
-
-  // 명시적으로도 보강
   span.setTag("error.type", error.name || "Error");
   span.setTag("error.message", error.message || "unknown error");
   span.setTag("error.stack", error.stack || "");
@@ -158,6 +182,50 @@ function markSpanError(error, extraTags = {}) {
     }
   }
 }
+
+/**
+ * 공통 request/response body 추적 middleware
+ * - req.body는 express.json() 이후 접근 가능
+ * - res.json / res.send 결과를 span tag에 기록
+ */
+app.use((req, res, next) => {
+  const span = tracer.scope().active();
+
+  if (span) {
+    span.setTag("http.method", req.method);
+    span.setTag("http.route.path", req.path);
+    setRequestBodyOnSpan(span, req.body);
+  }
+
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+
+  res.json = function patchedJson(body) {
+    const currentSpan = tracer.scope().active() || span;
+    if (currentSpan) {
+      setResponseBodyOnSpan(currentSpan, body);
+      currentSpan.setTag("http.status_code", res.statusCode);
+    }
+    return originalJson(body);
+  };
+
+  res.send = function patchedSend(body) {
+    const currentSpan = tracer.scope().active() || span;
+    if (currentSpan) {
+      try {
+        const parsed =
+          typeof body === "string" ? safeJsonParse(body, body) : body;
+        setResponseBodyOnSpan(currentSpan, parsed);
+      } catch {
+        setResponseBodyOnSpan(currentSpan, body);
+      }
+      currentSpan.setTag("http.status_code", res.statusCode);
+    }
+    return originalSend(body);
+  };
+
+  next();
+});
 
 /**
  * DB 헬퍼
@@ -427,10 +495,10 @@ const classifyUserIntent = llmobs.wrap(
       needDocs: shouldUseDocs(safeMessage),
     };
 
-    llmobs.annotate(undefined, {
-      inputData: safeMessage,
-      outputData: JSON.stringify(result),
-    });
+llmobs.annotate(undefined, {
+  inputData: String(message),
+  outputData: JSON.stringify(result),
+});
 
     return result;
   }
@@ -544,7 +612,7 @@ function buildToolDefinitions() {
  * 헬스체크
  */
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  return res.json({ ok: true });
 });
 
 /**
@@ -558,18 +626,41 @@ app.get("/conversations", (req, res) => {
       return res.status(400).json({ error: "sessionId is required" });
     }
 
-    // 데모용 강제 에러
     if (String(forceError) === "true") {
       throw new Error("Intentional backend error for demo");
     }
 
+const span = tracer.scope().active();
+
+if (span) {
+  span.setTag("app.feature", "conversations");
+  span.setTag("app.route", "GET /conversations");
+  setRequestBodyOnSpan(span, {
+    query: req.query,
+    params: req.params,
+  });
+}
+
+    logger.info("conversations_request_received", {
+      session_id: sessionId,
+      query: req.query,
+    });
+
     const conversations = getConversationsBySessionId(sessionId);
-    return res.json({ conversations });
+    const responseBody = { conversations };
+
+    logger.info("conversations_request_success", {
+      session_id: sessionId,
+      response_body: responseBody,
+    });
+
+    return res.json(responseBody);
   } catch (error) {
     console.error("conversations error:", error);
 
     logger.error("conversations_failed", {
       session_id: req.query?.sessionId || "unknown",
+      query: req.query,
       error_message: error.message,
       error_stack: error.stack,
     });
@@ -578,6 +669,7 @@ app.get("/conversations", (req, res) => {
       "app.feature": "conversations",
       "app.route": "GET /conversations",
       "app.session_id": req.query?.sessionId || "unknown",
+      "http.request.body": safeStringify(req.query),
     });
 
     return res.status(500).json({
@@ -598,14 +690,38 @@ app.get("/conversations/:conversationId/messages", (req, res) => {
       throw new Error("Intentional conversation messages error for demo");
     }
 
-    const messages = getMessagesByConversationId(conversationId);
+const span = tracer.scope().active();
+if (span) {
+  span.setTag("app.feature", "conversation_messages");
+  span.setTag("app.route", "GET /conversations/:conversationId/messages");
+  setRequestBodyOnSpan(span, {
+    query: req.query,
+    params: req.params,
+  });
+}
 
-    return res.json({ messages });
+    logger.info("conversation_messages_request_received", {
+      conversation_id: conversationId,
+      params: req.params,
+      query: req.query,
+    });
+
+    const messages = getMessagesByConversationId(conversationId);
+    const responseBody = { messages };
+
+    logger.info("conversation_messages_request_success", {
+      conversation_id: conversationId,
+      response_body: responseBody,
+    });
+
+    return res.json(responseBody);
   } catch (error) {
     console.error("conversation messages error:", error);
 
     logger.error("conversation_messages_failed", {
       conversation_id: req.params?.conversationId || "unknown",
+      params: req.params,
+      query: req.query,
       error_message: error.message,
       error_stack: error.stack,
     });
@@ -614,6 +730,10 @@ app.get("/conversations/:conversationId/messages", (req, res) => {
       "app.feature": "conversation_messages",
       "app.route": "GET /conversations/:conversationId/messages",
       "app.conversation_id": req.params?.conversationId || "unknown",
+      "http.request.body": safeStringify({
+        params: req.params,
+        query: req.query,
+      }),
     });
 
     return res.status(500).json({
@@ -637,16 +757,15 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "message is required" });
     }
 
-    // 데모용 강제 에러
     if (forceError === true || shouldForceDemoError(message)) {
       throw new Error("Intentional backend error for demo");
     }
 
-    logger.info("chat_request_started", {
-      session_id: sessionId,
-      conversation_id: conversationId || "new",
-      message_preview: String(message).slice(0, 120),
-    });
+logger.info("chat_request_received", {
+  session_id: sessionId,
+  conversation_id: conversationId || "new",
+  request_body: req.body,
+});
 
     let conversation;
 
@@ -663,13 +782,20 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    const activeSpan = tracer.scope().active();
-    if (activeSpan) {
-      activeSpan.setTag("app.session_id", sessionId);
-      activeSpan.setTag("app.conversation_id", conversation.id);
-      activeSpan.setTag("app.feature", "chat");
-      activeSpan.setTag("app.route", "POST /chat");
-    }
+const activeSpan = tracer.scope().active();
+
+if (activeSpan) {
+  activeSpan.setTag("app.feature", "chat");
+  activeSpan.setTag("app.route", "POST /chat");
+  setRequestBodyOnSpan(activeSpan, req.body);
+
+  if (req.body?.message) {
+    activeSpan.setTag(
+      "app.request.message",
+      String(req.body.message).slice(0, 50)
+    );
+  }
+}
 
     const result = await llmobs.trace(
       {
@@ -842,6 +968,7 @@ IMPORTANT RULES:
                   conversation_id: conversation.id,
                   tool_name: toolName,
                   tool_args: parsedArgs,
+                  tool_result: toolResult,
                 });
 
                 createMessage({
@@ -924,12 +1051,16 @@ IMPORTANT RULES:
               activeSpan.setTag("app.rag.chunk_size", RAG_CHUNK_SIZE);
               activeSpan.setTag("app.rag.chunk_overlap", RAG_CHUNK_OVERLAP);
               activeSpan.setTag("app.rag.top_k", RAG_TOP_K);
+              activeSpan.setTag("app.response.message", String(answer).slice(0, 100))
             }
 
-            llmobs.annotate(undefined, {
-              inputData: String(message),
-              outputData: String(answer),
-            });
+llmobs.annotate(undefined, {
+  inputData: String(message),
+  outputData: answer,
+  metadata: {
+    message: answer,
+  },
+});
 
             return {
               answer,
@@ -943,18 +1074,21 @@ IMPORTANT RULES:
           }
         );
 
-        llmobs.annotate(undefined, {
-          inputData: String(message),
-          outputData: String(workflowResult.answer),
-        });
+llmobs.annotate(undefined, {
+  inputData: String(message),
+  outputData: workflowResult.answer,
+  metadata: {
+    message: workflowResult.answer,
+  },
+});
 
         return workflowResult;
       }
     );
 
-    return res.json({
+    const responseBody = {
       conversationId: conversation.id,
-      text: result.answer,
+      message: result.answer,
       model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
       promptTokens: result.finalPromptTokens,
       completionTokens: result.finalCompletionTokens,
@@ -963,13 +1097,26 @@ IMPORTANT RULES:
       llmLatencyMs: result.finalLatencyMs,
       usedTools: result.usedTools,
       retrievalCount: result.retrievedChunks.length,
-    });
+    };
+
+logger.info("chat_request_success", {
+  session_id: sessionId,
+  conversation_id: conversation.id,
+  "http.request.body": req.body,
+  "http.response.body": responseBody,
+});
+    if (activeSpan) {
+      setResponseBodyOnSpan(activeSpan, responseBody);
+    }
+
+    return res.json(responseBody);
   } catch (error) {
     console.error("chat error:", error);
 
     logger.error("chat_request_failed", {
       session_id: req.body?.sessionId || "unknown",
       conversation_id: req.body?.conversationId || "unknown",
+      "http.request.body": req.body,
       error_message: error.message,
       error_stack: error.stack,
     });
@@ -979,6 +1126,7 @@ IMPORTANT RULES:
       "app.route": "POST /chat",
       "app.session_id": req.body?.sessionId || "unknown",
       "app.conversation_id": req.body?.conversationId || "unknown",
+      "http.request.body": safeStringify(req.body),
     });
 
     return res.status(500).json({
