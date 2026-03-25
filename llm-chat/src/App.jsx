@@ -295,12 +295,12 @@ export default function App() {
 
       const latencyMs = Date.now() - startedAt;
 
-      const assistantMessage = {
-        id: Date.now() + 1,
-        role: "assistant",
-        content: data?.text || "응답이 비어 있습니다.",
-        timestamp: new Date().toLocaleTimeString(),
-      };
+const assistantMessage = {
+  id: Date.now() + 1,
+  role: "assistant",
+  content: data?.message || data?.text || "응답이 비어 있습니다.",
+  timestamp: new Date().toLocaleTimeString(),
+};
 
       setMessages((prev) => [...prev, assistantMessage]);
 
