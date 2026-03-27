@@ -101,3 +101,42 @@ code {
   padding: 4px 8px;
   background: var(--code-bg);
 }
+.auth-input::placeholder {
+  color: #9ca3af;
+}
+
+.auth-input:hover {
+  border-color: #c7d2fe;
+}
+
+.auth-input:focus {
+  border-color: #4da3ff !important;
+  box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.15);
+  background: #ffffff;
+  transform: scale(1.01);
+}
+
+.auth-submit:hover:not(:disabled) {
+  background: #3b8be6 !important;
+  transform: translateY(-1px);
+}
+
+.auth-submit:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.auth-submit:disabled {
+  background: #9ca3af !important;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.auth-card {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.auth-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+}
