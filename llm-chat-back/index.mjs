@@ -61,6 +61,14 @@ const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -93,6 +101,9 @@ db.exec(`
     ON messages(created_at);
 `);
 
+const authSessions = new Map();
+const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+
 /**
  * 전역 예외 로그
  */
@@ -120,6 +131,10 @@ function generateId(prefix = "id") {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function hashPassword(password) {
+  return crypto.createHash("sha256").update(String(password)).digest("hex");
 }
 
 function safeJsonParse(value, fallback = {}) {
@@ -155,6 +170,32 @@ function safeStringify(value) {
       stringify_error: error.message,
     });
   }
+}
+
+function toSafeUser(userRow) {
+  if (!userRow) return null;
+
+  return {
+    id: userRow.id,
+    name: userRow.name,
+    email: userRow.email,
+    created_at: userRow.created_at,
+  };
+}
+
+function issueAuthToken(userId) {
+  const token = `tok_${crypto.randomUUID()}`;
+  authSessions.set(token, {
+    userId,
+    expiresAt: Date.now() + AUTH_SESSION_TTL_MS,
+  });
+  return token;
+}
+
+function resolveBearerToken(authorizationHeader) {
+  const raw = String(authorizationHeader ?? "");
+  if (!raw.startsWith("Bearer ")) return null;
+  return raw.slice("Bearer ".length).trim() || null;
 }
 
 function setRequestBodyOnSpan(span, body) {
@@ -353,6 +394,65 @@ function getConversationsBySessionId(sessionId) {
   `);
 
   return stmt.all(sessionId);
+}
+
+function createUser({ name, email, password }) {
+  const id = generateId("user");
+  const createdAt = nowIso();
+  const stmt = db.prepare(`
+    INSERT INTO users (id, name, email, password_hash, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  stmt.run(id, name, email, hashPassword(password), createdAt);
+  return getUserById(id);
+}
+
+function getUserById(userId) {
+  const stmt = db.prepare(`
+    SELECT id, name, email, password_hash, created_at
+    FROM users
+    WHERE id = ?
+  `);
+  return stmt.get(userId);
+}
+
+function getUserByEmail(email) {
+  const stmt = db.prepare(`
+    SELECT id, name, email, password_hash, created_at
+    FROM users
+    WHERE email = ?
+  `);
+  return stmt.get(email);
+}
+
+function requireAuth(req, res, next) {
+  const token = resolveBearerToken(req.headers.authorization);
+  if (!token) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const session = authSessions.get(token);
+  if (!session) {
+    return res.status(401).json({ error: "invalid token" });
+  }
+
+  if (session.expiresAt <= Date.now()) {
+    authSessions.delete(token);
+    return res.status(401).json({ error: "token expired" });
+  }
+
+  const user = getUserById(session.userId);
+  if (!user) {
+    authSessions.delete(token);
+    return res.status(401).json({ error: "invalid user" });
+  }
+
+  req.auth = {
+    token,
+    session,
+    user: toSafeUser(user),
+  };
+  return next();
 }
 
 /**
@@ -608,6 +708,75 @@ function buildToolDefinitions() {
   ];
 }
 
+app.post("/auth/register", (req, res) => {
+  try {
+    const name = String(req.body?.name ?? "").trim();
+    const email = String(req.body?.email ?? "")
+      .trim()
+      .toLowerCase();
+    const password = String(req.body?.password ?? "");
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: "name, email, password are required" });
+    }
+
+    if (getUserByEmail(email)) {
+      return res.status(409).json({ error: "email already exists" });
+    }
+
+    const user = createUser({ name, email, password });
+    const token = issueAuthToken(user.id);
+
+    return res.status(201).json({
+      token,
+      user: toSafeUser(user),
+    });
+  } catch (error) {
+    markSpanError(error, {
+      "app.feature": "auth",
+      "app.route": "POST /auth/register",
+    });
+    return res.status(500).json({ error: "internal server error" });
+  }
+});
+
+app.post("/auth/login", (req, res) => {
+  try {
+    const email = String(req.body?.email ?? "")
+      .trim()
+      .toLowerCase();
+    const password = String(req.body?.password ?? "");
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+
+    const user = getUserByEmail(email);
+    if (!user || user.password_hash !== hashPassword(password)) {
+      return res.status(401).json({ error: "invalid credentials" });
+    }
+
+    const token = issueAuthToken(user.id);
+
+    return res.json({
+      token,
+      user: toSafeUser(user),
+    });
+  } catch (error) {
+    markSpanError(error, {
+      "app.feature": "auth",
+      "app.route": "POST /auth/login",
+    });
+    return res.status(500).json({ error: "internal server error" });
+  }
+});
+
+app.get("/auth/me", requireAuth, (req, res) => {
+  return res.json({
+    user: req.auth.user,
+  });
+});
+
 /**
  * 헬스체크
  */
@@ -618,13 +787,12 @@ app.get("/health", (_req, res) => {
 /**
  * 대화 목록 조회
  */
-app.get("/conversations", (req, res) => {
+app.get("/conversations", requireAuth, (req, res) => {
   try {
     const { sessionId, forceError } = req.query;
-
-    if (!sessionId) {
-      return res.status(400).json({ error: "sessionId is required" });
-    }
+    const resolvedSessionId = String(
+      sessionId || `user_${req.auth?.user?.id || "anonymous"}`
+    );
 
     if (String(forceError) === "true") {
       throw new Error("Intentional backend error for demo");
@@ -642,15 +810,15 @@ if (span) {
 }
 
     logger.info("conversations_request_received", {
-      session_id: sessionId,
+      session_id: resolvedSessionId,
       query: req.query,
     });
 
-    const conversations = getConversationsBySessionId(sessionId);
+    const conversations = getConversationsBySessionId(resolvedSessionId);
     const responseBody = { conversations };
 
     logger.info("conversations_request_success", {
-      session_id: sessionId,
+      session_id: resolvedSessionId,
       response_body: responseBody,
     });
 
@@ -681,10 +849,11 @@ if (span) {
 /**
  * 특정 대화 메시지 조회
  */
-app.get("/conversations/:conversationId/messages", (req, res) => {
+app.get("/conversations/:conversationId/messages", requireAuth, (req, res) => {
   try {
     const { conversationId } = req.params;
     const { forceError } = req.query;
+    const resolvedSessionId = `user_${req.auth?.user?.id || "anonymous"}`;
 
     if (String(forceError) === "true") {
       throw new Error("Intentional conversation messages error for demo");
@@ -705,6 +874,11 @@ if (span) {
       params: req.params,
       query: req.query,
     });
+
+    const conversation = getConversationById(conversationId);
+    if (!conversation || conversation.session_id !== resolvedSessionId) {
+      return res.status(404).json({ error: "conversation not found" });
+    }
 
     const messages = getMessagesByConversationId(conversationId);
     const responseBody = { messages };
@@ -745,9 +919,12 @@ if (span) {
 /**
  * 채팅
  */
-app.post("/chat", async (req, res) => {
+app.post("/chat", requireAuth, async (req, res) => {
   const requestSpan = tracer.scope().active();
   const { sessionId, conversationId, message, forceError } = req.body ?? {};
+  const resolvedSessionId = String(
+    sessionId || `user_${req.auth?.user?.id || "anonymous"}`
+  );
 
   try {
     if (forceError === true) {
@@ -762,7 +939,7 @@ app.post("/chat", async (req, res) => {
       }
 
       logger.error("chat_request_failed", {
-        session_id: sessionId || "unknown",
+        session_id: resolvedSessionId,
         conversation_id: conversationId || "unknown",
         "http.request.body": req.body,
         error_message: error.message,
@@ -774,16 +951,12 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    if (!sessionId) {
-      return res.status(400).json({ error: "sessionId is required" });
-    }
-
     if (!message || !String(message).trim()) {
       return res.status(400).json({ error: "message is required" });
     }
 
     logger.info("chat_request_received", {
-      session_id: sessionId,
+      session_id: resolvedSessionId,
       conversation_id: conversationId || "new",
       request_body: req.body,
     });
@@ -793,12 +966,12 @@ app.post("/chat", async (req, res) => {
     if (conversationId) {
       conversation = getConversationById(conversationId);
 
-      if (!conversation) {
+      if (!conversation || conversation.session_id !== resolvedSessionId) {
         return res.status(404).json({ error: "conversation not found" });
       }
     } else {
       conversation = createConversation({
-        sessionId,
+        sessionId: resolvedSessionId,
         title: String(message).slice(0, 30),
       });
     }
@@ -822,7 +995,7 @@ if (activeSpan) {
       {
         kind: "agent",
         name: "chat_agent",
-        sessionId,
+        sessionId: resolvedSessionId,
         mlApp: ML_APP,
       },
       async () => {
@@ -830,7 +1003,7 @@ if (activeSpan) {
           {
             kind: "workflow",
             name: "process_chat_request",
-            sessionId,
+            sessionId: resolvedSessionId,
             mlApp: ML_APP,
           },
           async () => {
@@ -871,7 +1044,7 @@ IMPORTANT RULES:
             const intent = classifyUserIntent(String(message));
 
             logger.info("chat_intent_classified", {
-              session_id: sessionId,
+              session_id: resolvedSessionId,
               conversation_id: conversation.id,
               need_time_tool: intent.needTimeTool,
               need_docs: intent.needDocs,
@@ -881,7 +1054,7 @@ IMPORTANT RULES:
 
             if (intent.needDocs) {
               logger.info("chat_before_query_embedding", {
-                session_id: sessionId,
+                session_id: resolvedSessionId,
                 conversation_id: conversation.id,
                 message_preview: String(message).slice(0, 120),
               });
@@ -889,7 +1062,7 @@ IMPORTANT RULES:
               const queryEmbedding = await embedUserQuery(String(message));
 
               logger.info("chat_after_query_embedding", {
-                session_id: sessionId,
+                session_id: resolvedSessionId,
                 conversation_id: conversation.id,
                 embedding_length: queryEmbedding.length,
               });
@@ -901,7 +1074,7 @@ IMPORTANT RULES:
               });
 
               logger.info("chat_retrieval_completed", {
-                session_id: sessionId,
+                session_id: resolvedSessionId,
                 conversation_id: conversation.id,
                 retrieval_count: retrievedChunks.length,
                 retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
@@ -985,7 +1158,7 @@ IMPORTANT RULES:
                 }
 
                 logger.info("chat_tool_executed", {
-                  session_id: sessionId,
+                  session_id: resolvedSessionId,
                   conversation_id: conversation.id,
                   tool_name: toolName,
                   tool_args: parsedArgs,
@@ -1028,7 +1201,7 @@ IMPORTANT RULES:
                 "응답이 비어 있습니다.";
             }
 
-            createMessage({
+            const assistantMessage = createMessage({
               conversationId: conversation.id,
               role: "assistant",
               content: answer,
@@ -1047,7 +1220,7 @@ IMPORTANT RULES:
             });
 
             logger.info("chat_request_completed", {
-              session_id: sessionId,
+              session_id: resolvedSessionId,
               conversation_id: conversation.id,
               model: finalModel,
               latency_ms: finalLatencyMs,
@@ -1084,6 +1257,7 @@ llmobs.annotate(undefined, {
 });
 
             return {
+              assistantMessage,
               answer,
               finalModel,
               finalPromptTokens,
@@ -1109,7 +1283,22 @@ llmobs.annotate(undefined, {
 
     const responseBody = {
       conversationId: conversation.id,
-      message: result.answer,
+      message: {
+        id: result.assistantMessage.id,
+        role: "assistant",
+        content: result.assistantMessage.content,
+        created_at: result.assistantMessage.created_at,
+      },
+      trace: {
+        model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+        promptTokens: result.finalPromptTokens,
+        completionTokens: result.finalCompletionTokens,
+        totalTokens:
+          (result.finalPromptTokens ?? 0) + (result.finalCompletionTokens ?? 0),
+        totalLatencyMs: result.finalLatencyMs,
+        costEstimate: null,
+      },
+      answer: result.answer,
       model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
       promptTokens: result.finalPromptTokens,
       completionTokens: result.finalCompletionTokens,
@@ -1121,7 +1310,7 @@ llmobs.annotate(undefined, {
     };
 
 logger.info("chat_request_success", {
-  session_id: sessionId,
+  session_id: resolvedSessionId,
   conversation_id: conversation.id,
   "http.request.body": req.body,
   "http.response.body": responseBody,
