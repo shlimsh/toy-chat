@@ -20,8 +20,8 @@ datadogRum.init({
   defaultPrivacyLevel: "mask-user-input",
   allowedTracingUrls: [
     {
-      match: /http:\/\/(localhost|127\.0\.0\.1):3001/,
-      propagatorTypes: ["tracecontext", "datadog"],
+    match: /\/(auth|chat|conversations|health)(\/|$)/,
+    propagatorTypes: ["tracecontext", "datadog"],
     },
   ],
     plugins: [reactPlugin()],

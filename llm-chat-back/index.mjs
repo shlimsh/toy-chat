@@ -1,13 +1,16 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
 import OpenAI from "openai";
-import Database from "better-sqlite3";
-import fs from "fs";
-import path from "path";
 import crypto from "crypto";
 import tracer from "dd-trace";
 import logger from "./logger.mjs";
+import { query, initDatabase } from "./db.mjs";
+import {
+  hashPassword,
+  comparePassword,
+  signToken,
+  authRequired,
+} from "./auth.mjs";
 import {
   loadDocuments,
   buildChunkRecords,
@@ -28,11 +31,10 @@ const llmobs = tracer.llmobs;
 const ML_APP =
   process.env.DD_LLMOBS_ML_APP || process.env.DD_SERVICE || "shlim-toy-chat";
 
-app.use(
-  cors({
-    origin: "http://localhost:5173",
-  })
-);
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
 
 app.use(express.json());
 
@@ -43,55 +45,10 @@ const client = new OpenAI({
 const EMBEDDING_MODEL =
   process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
 
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const RAG_CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE || 1000);
 const RAG_CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP || 150);
 const RAG_TOP_K = Number(process.env.RAG_TOP_K || 3);
-
-/**
- * SQLite 초기화
- */
-const dataDir = path.join(process.cwd(), "data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-const dbPath = path.join(dataDir, "chat.db");
-const db = new Database(dbPath);
-
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    title TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    model TEXT,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    latency_ms INTEGER,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_conversations_session_id
-    ON conversations(session_id);
-
-  CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
-    ON messages(conversation_id);
-
-  CREATE INDEX IF NOT EXISTS idx_messages_created_at
-    ON messages(created_at);
-`);
 
 /**
  * 전역 예외 로그
@@ -115,11 +72,7 @@ process.on("unhandledRejection", (reason) => {
  * 유틸
  */
 function generateId(prefix = "id") {
-  return `${prefix}_${crypto.randomUUID()}`;
-}
-
-function nowIso() {
-  return new Date().toISOString();
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`.slice(0, 64);
 }
 
 function safeJsonParse(value, fallback = {}) {
@@ -128,23 +81,6 @@ function safeJsonParse(value, fallback = {}) {
   } catch {
     return fallback;
   }
-}
-
-function shouldUseTimeTool(message) {
-  return /현재 시간|지금 시간|몇 시|시각|time/i.test(String(message));
-}
-
-function shouldUseDocs(message) {
-  return String(message ?? "").trim().length > 0;
-}
-
-function shouldForceDemoError(message) {
-  const safeMessage = String(message ?? "");
-  return (
-    safeMessage.includes("백엔드 에러 테스트") ||
-    safeMessage.includes("에러 테스트") ||
-    safeMessage.includes("error test")
-  );
 }
 
 function safeStringify(value) {
@@ -157,9 +93,17 @@ function safeStringify(value) {
   }
 }
 
+function shouldUseTimeTool(message) {
+  return /현재 시간|지금 시간|몇 시|시각|time/i.test(String(message));
+}
+
+function shouldUseDocs(message) {
+  return String(message ?? "").trim().length > 0;
+}
+
 function setRequestBodyOnSpan(span, body) {
   if (!span) return;
-span.setTag("http.request.body", safeStringify(body));
+  span.setTag("http.request.body", safeStringify(body));
 }
 
 function setResponseBodyOnSpan(span, body) {
@@ -185,8 +129,6 @@ function markSpanError(error, extraTags = {}) {
 
 /**
  * 공통 request/response body 추적 middleware
- * - req.body는 express.json() 이후 접근 가능
- * - res.json / res.send 결과를 span tag에 기록
  */
 app.use((req, res, next) => {
   const span = tracer.scope().active();
@@ -212,13 +154,9 @@ app.use((req, res, next) => {
   res.send = function patchedSend(body) {
     const currentSpan = tracer.scope().active() || span;
     if (currentSpan) {
-      try {
-        const parsed =
-          typeof body === "string" ? safeJsonParse(body, body) : body;
-        setResponseBodyOnSpan(currentSpan, parsed);
-      } catch {
-        setResponseBodyOnSpan(currentSpan, body);
-      }
+      const parsed =
+        typeof body === "string" ? safeJsonParse(body, body) : body;
+      setResponseBodyOnSpan(currentSpan, parsed);
       currentSpan.setTag("http.status_code", res.statusCode);
     }
     return originalSend(body);
@@ -230,133 +168,195 @@ app.use((req, res, next) => {
 /**
  * DB 헬퍼
  */
-function createConversation({ sessionId, title }) {
-  const id = generateId("conv");
-  const now = nowIso();
-
-  const stmt = db.prepare(`
-    INSERT INTO conversations (id, session_id, title, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(id, sessionId, title, now, now);
-
-  return {
-    id,
-    session_id: sessionId,
-    title,
-    created_at: now,
-    updated_at: now,
-  };
+async function getUserByEmail(email) {
+  const rows = await query(
+    `
+    SELECT id, email, password_hash, name, created_at, updated_at
+    FROM users
+    WHERE email = ?
+    LIMIT 1
+    `,
+    [email]
+  );
+  return rows[0] || null;
 }
 
-function getConversationById(conversationId) {
-  const stmt = db.prepare(`
-    SELECT *
+async function getUserById(userId) {
+  const rows = await query(
+    `
+    SELECT id, email, name, created_at, updated_at
+    FROM users
+    WHERE id = ?
+    LIMIT 1
+    `,
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+async function createUser({ name, email, passwordHash }) {
+  const result = await query(
+    `
+    INSERT INTO users (name, email, password_hash)
+    VALUES (?, ?, ?)
+    `,
+    [name, email, passwordHash]
+  );
+
+  return getUserById(result.insertId);
+}
+
+async function createConversation({ userId, title }) {
+  const id = generateId("conv");
+
+  await query(
+    `
+    INSERT INTO conversations (id, user_id, title)
+    VALUES (?, ?, ?)
+    `,
+    [id, userId, title]
+  );
+
+  const rows = await query(
+    `
+    SELECT id, user_id, title, created_at, updated_at
     FROM conversations
     WHERE id = ?
-  `);
+    LIMIT 1
+    `,
+    [id]
+  );
 
-  return stmt.get(conversationId);
+  return rows[0] || null;
 }
 
-function updateConversationTimestamp(conversationId) {
-  const stmt = db.prepare(`
-    UPDATE conversations
-    SET updated_at = ?
+async function getConversationById(conversationId) {
+  const rows = await query(
+    `
+    SELECT id, user_id, title, created_at, updated_at
+    FROM conversations
     WHERE id = ?
-  `);
+    LIMIT 1
+    `,
+    [conversationId]
+  );
 
-  stmt.run(nowIso(), conversationId);
+  return rows[0] || null;
 }
 
-function createMessage({
+async function getConversationByIdForUser(conversationId, userId) {
+  const rows = await query(
+    `
+    SELECT id, user_id, title, created_at, updated_at
+    FROM conversations
+    WHERE id = ? AND user_id = ?
+    LIMIT 1
+    `,
+    [conversationId, userId]
+  );
+
+  return rows[0] || null;
+}
+
+async function updateConversationTimestamp(conversationId) {
+  await query(
+    `
+    UPDATE conversations
+    SET updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+    `,
+    [conversationId]
+  );
+}
+
+async function createMessage({
   conversationId,
   role,
   content,
-  model = null,
-  inputTokens = null,
-  outputTokens = null,
-  latencyMs = null,
   metadata = null,
 }) {
-  const id = generateId("msg");
-  const createdAt = nowIso();
-
-  const stmt = db.prepare(`
+  const result = await query(
+    `
     INSERT INTO messages (
+      conversation_id,
+      role,
+      content,
+      metadata_json
+    )
+    VALUES (?, ?, ?, ?)
+    `,
+    [
+      conversationId,
+      role,
+      content,
+      metadata ? JSON.stringify(metadata) : null,
+    ]
+  );
+
+  await updateConversationTimestamp(conversationId);
+
+  const rows = await query(
+    `
+    SELECT
       id,
       conversation_id,
       role,
       content,
-      model,
-      input_tokens,
-      output_tokens,
-      latency_ms,
-      metadata,
+      metadata_json,
       created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(
-    id,
-    conversationId,
-    role,
-    content,
-    model,
-    inputTokens,
-    outputTokens,
-    latencyMs,
-    metadata ? JSON.stringify(metadata) : null,
-    createdAt
+    FROM messages
+    WHERE id = ?
+    LIMIT 1
+    `,
+    [result.insertId]
   );
 
-  updateConversationTimestamp(conversationId);
+  const row = rows[0] || null;
+  if (!row) return null;
 
   return {
-    id,
-    conversation_id: conversationId,
-    role,
-    content,
-    model,
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    latency_ms: latencyMs,
-    metadata,
-    created_at: createdAt,
+    ...row,
+    metadata: row.metadata_json ? safeJsonParse(row.metadata_json, null) : null,
   };
 }
 
-function getMessagesByConversationId(conversationId) {
-  const stmt = db.prepare(`
-    SELECT *
+async function getMessagesByConversationId(conversationId) {
+  const rows = await query(
+    `
+    SELECT
+      id,
+      conversation_id,
+      role,
+      content,
+      metadata_json,
+      created_at
     FROM messages
     WHERE conversation_id = ?
-    ORDER BY created_at ASC
-  `);
-
-  const rows = stmt.all(conversationId);
+    ORDER BY created_at ASC, id ASC
+    `,
+    [conversationId]
+  );
 
   return rows.map((row) => ({
     ...row,
-    metadata: row.metadata ? JSON.parse(row.metadata) : null,
+    metadata: row.metadata_json ? safeJsonParse(row.metadata_json, null) : null,
   }));
 }
 
-function getConversationsBySessionId(sessionId) {
-  const stmt = db.prepare(`
-    SELECT *
+async function getConversationsByUserId(userId) {
+  return query(
+    `
+    SELECT id, user_id, title, created_at, updated_at
     FROM conversations
-    WHERE session_id = ?
-    ORDER BY updated_at DESC
-  `);
-
-  return stmt.all(sessionId);
+    WHERE user_id = ?
+    ORDER BY updated_at DESC, created_at DESC
+    `,
+    [userId]
+  );
 }
 
 /**
- * RAG 인덱싱용 문서 embedding
+ * RAG
  */
 const embedTextForIndexing = llmobs.wrap(
   { kind: "embedding", name: "embed_document_chunk" },
@@ -495,10 +495,10 @@ const classifyUserIntent = llmobs.wrap(
       needDocs: shouldUseDocs(safeMessage),
     };
 
-llmobs.annotate(undefined, {
-  inputData: String(message),
-  outputData: JSON.stringify(result),
-});
+    llmobs.annotate(undefined, {
+      inputData: safeMessage,
+      outputData: JSON.stringify(result),
+    });
 
     return result;
   }
@@ -522,13 +522,10 @@ const getCurrentTimeTool = llmobs.wrap(
   }
 );
 
-/**
- * Query embedding 생성
- */
 const embedUserQuery = llmobs.wrap(
   { kind: "embedding", name: "embed_user_query" },
-  async function embedUserQuery(query) {
-    const safeQuery = String(query ?? "");
+  async function embedUserQuery(queryText) {
+    const safeQuery = String(queryText ?? "");
 
     const response = await client.embeddings.create({
       model: EMBEDDING_MODEL,
@@ -552,12 +549,11 @@ const embedUserQuery = llmobs.wrap(
 
 const retrieveRelevantChunks = llmobs.wrap(
   { kind: "retrieval", name: "vector_similarity_search" },
-  function retrieveRelevantChunks({ query, queryEmbedding, topK = 3 }) {
-    const safeQuery = String(query ?? "");
+  function retrieveRelevantChunks({ query: queryText, queryEmbedding, topK = 3 }) {
+    const safeQuery = String(queryText ?? "");
 
     const scored = VECTOR_STORE.map((item) => {
       const score = cosineSimilarity(queryEmbedding, item.embedding);
-
       return {
         ...item,
         score,
@@ -608,6 +604,17 @@ function buildToolDefinitions() {
   ];
 }
 
+function estimateCost({ promptTokens = 0, completionTokens = 0 }) {
+  const inputCostPer1M = 0.4;
+  const outputCostPer1M = 1.6;
+
+  const cost =
+    (Number(promptTokens || 0) / 1_000_000) * inputCostPer1M +
+    (Number(completionTokens || 0) / 1_000_000) * outputCostPer1M;
+
+  return cost.toFixed(6);
+}
+
 /**
  * 헬스체크
  */
@@ -616,51 +623,185 @@ app.get("/health", (_req, res) => {
 });
 
 /**
+ * 인증
+ */
+app.post("/auth/register", async (req, res) => {
+  try {
+    const { name, email, password } = req.body ?? {};
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name is required" });
+    }
+
+    if (!email || !String(email).trim()) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    if (!password || !String(password).trim()) {
+      return res.status(400).json({ error: "password is required" });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const existingUser = await getUserByEmail(normalizedEmail);
+
+    if (existingUser) {
+      return res.status(409).json({ error: "email already exists" });
+    }
+
+    const passwordHash = await hashPassword(String(password));
+    const user = await createUser({
+      name: String(name).trim(),
+      email: normalizedEmail,
+      passwordHash,
+    });
+
+    const token = signToken(user);
+
+    logger.info("auth_register_success", {
+      user_id: user.id,
+      email: user.email,
+    });
+
+    return res.json({
+      token,
+      user,
+    });
+  } catch (error) {
+    logger.error("auth_register_failed", {
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+
+    markSpanError(error, {
+      "app.feature": "auth",
+      "app.route": "POST /auth/register",
+    });
+
+    return res.status(500).json({
+      error: error?.message || "internal server error",
+    });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body ?? {};
+
+    if (!email || !String(email).trim()) {
+      return res.status(400).json({
+        error: "email_required",
+        message: "이메일을 입력해주세요.",
+      });
+    }
+
+    if (!password || !String(password).trim()) {
+      return res.status(400).json({
+        error: "password_required",
+        message: "비밀번호를 입력해주세요.",
+      });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = await getUserByEmail(normalizedEmail);
+
+    if (!user) {
+      return res.status(404).json({
+        error: "user_not_found",
+        message: "존재하지 않는 이메일입니다.",
+      });
+    }
+
+    const matched = await comparePassword(String(password), user.password_hash);
+
+    if (!matched) {
+      return res.status(401).json({
+        error: "invalid_password",
+        message: "비밀번호가 올바르지 않습니다.",
+      });
+    }
+
+    const safeUser = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      created_at: user.created_at,
+      updated_at: user.updated_at,
+    };
+
+    const token = signToken(safeUser);
+
+    logger.info("auth_login_success", {
+      user_id: safeUser.id,
+      email: safeUser.email,
+    });
+
+    return res.json({
+      token,
+      user: safeUser,
+    });
+  } catch (error) {
+    logger.error("auth_login_failed", {
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+
+    markSpanError(error, {
+      "app.feature": "auth",
+      "app.route": "POST /auth/login",
+    });
+
+    return res.status(500).json({
+      error: "internal_server_error",
+      message: error?.message || "internal server error",
+    });
+  }
+});
+
+app.get("/auth/me", authRequired, async (req, res) => {
+  try {
+    const user = await getUserById(req.user.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "invalid token" });
+    }
+
+    return res.json({ user });
+  } catch (error) {
+    logger.error("auth_me_failed", {
+      user_id: req.user?.userId,
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+
+    markSpanError(error, {
+      "app.feature": "auth",
+      "app.route": "GET /auth/me",
+      "app.user_id": req.user?.userId,
+    });
+
+    return res.status(500).json({
+      error: error?.message || "internal server error",
+    });
+  }
+});
+
+/**
  * 대화 목록 조회
  */
-app.get("/conversations", (req, res) => {
+app.get("/conversations", authRequired, async (req, res) => {
   try {
-    const { sessionId, forceError } = req.query;
-
-    if (!sessionId) {
-      return res.status(400).json({ error: "sessionId is required" });
-    }
-
-    if (String(forceError) === "true") {
-      throw new Error("Intentional backend error for demo");
-    }
-
-const span = tracer.scope().active();
-
-if (span) {
-  span.setTag("app.feature", "conversations");
-  span.setTag("app.route", "GET /conversations");
-  setRequestBodyOnSpan(span, {
-    query: req.query,
-    params: req.params,
-  });
-}
-
-    logger.info("conversations_request_received", {
-      session_id: sessionId,
-      query: req.query,
-    });
-
-    const conversations = getConversationsBySessionId(sessionId);
-    const responseBody = { conversations };
+    const userId = req.user.userId;
+    const conversations = await getConversationsByUserId(userId);
 
     logger.info("conversations_request_success", {
-      session_id: sessionId,
-      response_body: responseBody,
+      user_id: userId,
+      conversation_count: conversations.length,
     });
 
-    return res.json(responseBody);
+    return res.json({ conversations });
   } catch (error) {
-    console.error("conversations error:", error);
-
     logger.error("conversations_failed", {
-      session_id: req.query?.sessionId || "unknown",
-      query: req.query,
+      user_id: req.user?.userId,
       error_message: error.message,
       error_stack: error.stack,
     });
@@ -668,8 +809,7 @@ if (span) {
     markSpanError(error, {
       "app.feature": "conversations",
       "app.route": "GET /conversations",
-      "app.session_id": req.query?.sessionId || "unknown",
-      "http.request.body": safeStringify(req.query),
+      "app.user_id": req.user?.userId,
     });
 
     return res.status(500).json({
@@ -681,73 +821,58 @@ if (span) {
 /**
  * 특정 대화 메시지 조회
  */
-app.get("/conversations/:conversationId/messages", (req, res) => {
-  try {
-    const { conversationId } = req.params;
-    const { forceError } = req.query;
+app.get(
+  "/conversations/:conversationId/messages",
+  authRequired,
+  async (req, res) => {
+    try {
+      const { conversationId } = req.params;
+      const userId = req.user.userId;
 
-    if (String(forceError) === "true") {
-      throw new Error("Intentional conversation messages error for demo");
+      const conversation = await getConversationByIdForUser(conversationId, userId);
+
+      if (!conversation) {
+        return res.status(404).json({ error: "conversation not found" });
+      }
+
+      const messages = await getMessagesByConversationId(conversationId);
+
+      logger.info("conversation_messages_request_success", {
+        user_id: userId,
+        conversation_id: conversationId,
+        message_count: messages.length,
+      });
+
+      return res.json({ messages });
+    } catch (error) {
+      logger.error("conversation_messages_failed", {
+        user_id: req.user?.userId,
+        conversation_id: req.params?.conversationId,
+        error_message: error.message,
+        error_stack: error.stack,
+      });
+
+      markSpanError(error, {
+        "app.feature": "conversation_messages",
+        "app.route": "GET /conversations/:conversationId/messages",
+        "app.user_id": req.user?.userId,
+        "app.conversation_id": req.params?.conversationId,
+      });
+
+      return res.status(500).json({
+        error: error?.message || "internal server error",
+      });
     }
-
-const span = tracer.scope().active();
-if (span) {
-  span.setTag("app.feature", "conversation_messages");
-  span.setTag("app.route", "GET /conversations/:conversationId/messages");
-  setRequestBodyOnSpan(span, {
-    query: req.query,
-    params: req.params,
-  });
-}
-
-    logger.info("conversation_messages_request_received", {
-      conversation_id: conversationId,
-      params: req.params,
-      query: req.query,
-    });
-
-    const messages = getMessagesByConversationId(conversationId);
-    const responseBody = { messages };
-
-    logger.info("conversation_messages_request_success", {
-      conversation_id: conversationId,
-      response_body: responseBody,
-    });
-
-    return res.json(responseBody);
-  } catch (error) {
-    console.error("conversation messages error:", error);
-
-    logger.error("conversation_messages_failed", {
-      conversation_id: req.params?.conversationId || "unknown",
-      params: req.params,
-      query: req.query,
-      error_message: error.message,
-      error_stack: error.stack,
-    });
-
-    markSpanError(error, {
-      "app.feature": "conversation_messages",
-      "app.route": "GET /conversations/:conversationId/messages",
-      "app.conversation_id": req.params?.conversationId || "unknown",
-      "http.request.body": safeStringify({
-        params: req.params,
-        query: req.query,
-      }),
-    });
-
-    return res.status(500).json({
-      error: error?.message || "internal server error",
-    });
   }
-});
+);
 
 /**
  * 채팅
  */
-app.post("/chat", async (req, res) => {
+app.post("/chat", authRequired, async (req, res) => {
   const requestSpan = tracer.scope().active();
-  const { sessionId, conversationId, message, forceError } = req.body ?? {};
+  const { conversationId, message, forceError } = req.body ?? {};
+  const userId = req.user.userId;
 
   try {
     if (forceError === true) {
@@ -762,9 +887,9 @@ app.post("/chat", async (req, res) => {
       }
 
       logger.error("chat_request_failed", {
-        session_id: sessionId || "unknown",
-        conversation_id: conversationId || "unknown",
-        "http.request.body": req.body,
+        user_id: userId,
+        conversation_id: conversationId || "new",
+        request_body: req.body,
         error_message: error.message,
         error_stack: error.stack,
       });
@@ -774,16 +899,12 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    if (!sessionId) {
-      return res.status(400).json({ error: "sessionId is required" });
-    }
-
     if (!message || !String(message).trim()) {
       return res.status(400).json({ error: "message is required" });
     }
 
     logger.info("chat_request_received", {
-      session_id: sessionId,
+      user_id: userId,
       conversation_id: conversationId || "new",
       request_body: req.body,
     });
@@ -791,38 +912,40 @@ app.post("/chat", async (req, res) => {
     let conversation;
 
     if (conversationId) {
-      conversation = getConversationById(conversationId);
+      conversation = await getConversationByIdForUser(conversationId, userId);
 
       if (!conversation) {
         return res.status(404).json({ error: "conversation not found" });
       }
     } else {
-      conversation = createConversation({
-        sessionId,
+      conversation = await createConversation({
+        userId,
         title: String(message).slice(0, 30),
       });
     }
 
-const activeSpan = tracer.scope().active();
+    const activeSpan = tracer.scope().active();
 
-if (activeSpan) {
-  activeSpan.setTag("app.feature", "chat");
-  activeSpan.setTag("app.route", "POST /chat");
-  setRequestBodyOnSpan(activeSpan, req.body);
+    if (activeSpan) {
+      activeSpan.setTag("app.feature", "chat");
+      activeSpan.setTag("app.route", "POST /chat");
+      activeSpan.setTag("app.user_id", userId);
+      activeSpan.setTag("app.conversation_id", conversation.id);
+      setRequestBodyOnSpan(activeSpan, req.body);
 
-  if (req.body?.message) {
-    activeSpan.setTag(
-      "app.request.message",
-      String(req.body.message).slice(0, 50)
-    );
-  }
-}
+      if (req.body?.message) {
+        activeSpan.setTag(
+          "app.request.message",
+          String(req.body.message).slice(0, 50)
+        );
+      }
+    }
 
     const result = await llmobs.trace(
       {
         kind: "agent",
         name: "chat_agent",
-        sessionId,
+        sessionId: String(userId),
         mlApp: ML_APP,
       },
       async () => {
@@ -830,20 +953,21 @@ if (activeSpan) {
           {
             kind: "workflow",
             name: "process_chat_request",
-            sessionId,
+            sessionId: String(userId),
             mlApp: ML_APP,
           },
           async () => {
-            createMessage({
+            await createMessage({
               conversationId: conversation.id,
               role: "user",
               content: String(message),
               metadata: {
                 source: "web",
+                user_id: userId,
               },
             });
 
-            const history = getMessagesByConversationId(conversation.id);
+            const history = await getMessagesByConversationId(conversation.id);
 
             const recentHistory = history
               .filter((msg) => msg.role === "user" || msg.role === "assistant")
@@ -860,7 +984,7 @@ IMPORTANT RULES:
 - Do NOT generate time yourself.
 - Always prefer using tools when available.
 - Use retrieved context if provided.
-`,
+                `.trim(),
               },
               ...recentHistory.map((msg) => ({
                 role: msg.role,
@@ -871,7 +995,7 @@ IMPORTANT RULES:
             const intent = classifyUserIntent(String(message));
 
             logger.info("chat_intent_classified", {
-              session_id: sessionId,
+              user_id: userId,
               conversation_id: conversation.id,
               need_time_tool: intent.needTimeTool,
               need_docs: intent.needDocs,
@@ -881,7 +1005,7 @@ IMPORTANT RULES:
 
             if (intent.needDocs) {
               logger.info("chat_before_query_embedding", {
-                session_id: sessionId,
+                user_id: userId,
                 conversation_id: conversation.id,
                 message_preview: String(message).slice(0, 120),
               });
@@ -889,7 +1013,7 @@ IMPORTANT RULES:
               const queryEmbedding = await embedUserQuery(String(message));
 
               logger.info("chat_after_query_embedding", {
-                session_id: sessionId,
+                user_id: userId,
                 conversation_id: conversation.id,
                 embedding_length: queryEmbedding.length,
               });
@@ -901,7 +1025,7 @@ IMPORTANT RULES:
               });
 
               logger.info("chat_retrieval_completed", {
-                session_id: sessionId,
+                user_id: userId,
                 conversation_id: conversation.id,
                 retrieval_count: retrievedChunks.length,
                 retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
@@ -926,12 +1050,10 @@ IMPORTANT RULES:
             const firstStartedAt = Date.now();
 
             const firstCompletion = await client.chat.completions.create({
-              model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+              model: OPENAI_MODEL,
               messages: [
                 ...llmMessages,
-                ...(docsContext
-                  ? [{ role: "system", content: docsContext }]
-                  : []),
+                ...(docsContext ? [{ role: "system", content: docsContext }] : []),
               ],
               tools: buildToolDefinitions(),
               tool_choice: "auto",
@@ -943,18 +1065,16 @@ IMPORTANT RULES:
             const toolCalls = firstMessage?.tool_calls || [];
 
             let finalModel = firstCompletion.model;
-            let finalPromptTokens = firstCompletion.usage?.prompt_tokens ?? null;
+            let finalPromptTokens = firstCompletion.usage?.prompt_tokens ?? 0;
             let finalCompletionTokens =
-              firstCompletion.usage?.completion_tokens ?? null;
+              firstCompletion.usage?.completion_tokens ?? 0;
             let finalLatencyMs = firstLatencyMs;
             let answer = firstMessage?.content || "응답이 비어 있습니다.";
 
             if (toolCalls.length > 0) {
               const secondMessages = [
                 ...llmMessages,
-                ...(docsContext
-                  ? [{ role: "system", content: docsContext }]
-                  : []),
+                ...(docsContext ? [{ role: "system", content: docsContext }] : []),
                 {
                   role: "assistant",
                   content: firstMessage.content || "",
@@ -971,9 +1091,7 @@ IMPORTANT RULES:
                 );
                 const toolKey = `${toolName}:${JSON.stringify(parsedArgs)}`;
 
-                if (executedToolKeys.has(toolKey)) {
-                  continue;
-                }
+                if (executedToolKeys.has(toolKey)) continue;
                 executedToolKeys.add(toolKey);
 
                 let toolResult;
@@ -985,14 +1103,14 @@ IMPORTANT RULES:
                 }
 
                 logger.info("chat_tool_executed", {
-                  session_id: sessionId,
+                  user_id: userId,
                   conversation_id: conversation.id,
                   tool_name: toolName,
                   tool_args: parsedArgs,
                   tool_result: toolResult,
                 });
 
-                createMessage({
+                await createMessage({
                   conversationId: conversation.id,
                   role: "tool",
                   content: JSON.stringify(toolResult),
@@ -1001,6 +1119,7 @@ IMPORTANT RULES:
                     tool_name: toolName,
                     tool_args: parsedArgs,
                     source: "tool_execution",
+                    user_id: userId,
                   },
                 });
 
@@ -1014,40 +1133,41 @@ IMPORTANT RULES:
               const secondStartedAt = Date.now();
 
               const secondCompletion = await client.chat.completions.create({
-                model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+                model: OPENAI_MODEL,
                 messages: secondMessages,
               });
 
               finalLatencyMs = firstLatencyMs + (Date.now() - secondStartedAt);
               finalModel = secondCompletion.model;
-              finalPromptTokens = secondCompletion.usage?.prompt_tokens ?? null;
+              finalPromptTokens = secondCompletion.usage?.prompt_tokens ?? 0;
               finalCompletionTokens =
-                secondCompletion.usage?.completion_tokens ?? null;
+                secondCompletion.usage?.completion_tokens ?? 0;
               answer =
                 secondCompletion.choices?.[0]?.message?.content ||
                 "응답이 비어 있습니다.";
             }
 
-            createMessage({
+            const assistantMessage = await createMessage({
               conversationId: conversation.id,
               role: "assistant",
               content: answer,
-              model: finalModel,
-              inputTokens: finalPromptTokens,
-              outputTokens: finalCompletionTokens,
-              latencyMs: finalLatencyMs,
               metadata: {
+                model: finalModel,
+                input_tokens: finalPromptTokens,
+                output_tokens: finalCompletionTokens,
+                latency_ms: finalLatencyMs,
                 used_tools: toolCalls.length > 0,
                 tool_names: toolCalls
                   .map((t) => t.function?.name)
                   .filter(Boolean),
                 retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
                 retrieval_count: retrievedChunks.length,
+                user_id: userId,
               },
             });
 
             logger.info("chat_request_completed", {
-              session_id: sessionId,
+              user_id: userId,
               conversation_id: conversation.id,
               model: finalModel,
               latency_ms: finalLatencyMs,
@@ -1060,11 +1180,8 @@ IMPORTANT RULES:
             if (activeSpan) {
               activeSpan.setTag("app.llm.model", finalModel || "unknown");
               activeSpan.setTag("app.llm.latency_ms", finalLatencyMs);
-              activeSpan.setTag("app.llm.input_tokens", finalPromptTokens ?? 0);
-              activeSpan.setTag(
-                "app.llm.output_tokens",
-                finalCompletionTokens ?? 0
-              );
+              activeSpan.setTag("app.llm.input_tokens", finalPromptTokens);
+              activeSpan.setTag("app.llm.output_tokens", finalCompletionTokens);
               activeSpan.setTag("app.tool.used", toolCalls.length > 0);
               activeSpan.setTag("app.tool.count", toolCalls.length);
               activeSpan.setTag("app.retrieval.count", retrievedChunks.length);
@@ -1072,19 +1189,23 @@ IMPORTANT RULES:
               activeSpan.setTag("app.rag.chunk_size", RAG_CHUNK_SIZE);
               activeSpan.setTag("app.rag.chunk_overlap", RAG_CHUNK_OVERLAP);
               activeSpan.setTag("app.rag.top_k", RAG_TOP_K);
-              activeSpan.setTag("app.response.message", String(answer).slice(0, 100))
+              activeSpan.setTag(
+                "app.response.message",
+                String(answer).slice(0, 100)
+              );
             }
 
-llmobs.annotate(undefined, {
-  inputData: String(message),
-  outputData: answer,
-  metadata: {
-    message: answer,
-  },
-});
+            llmobs.annotate(undefined, {
+              inputData: String(message),
+              outputData: answer,
+              metadata: {
+                message: answer,
+              },
+            });
 
             return {
               answer,
+              assistantMessage,
               finalModel,
               finalPromptTokens,
               finalCompletionTokens,
@@ -1095,49 +1216,64 @@ llmobs.annotate(undefined, {
           }
         );
 
-llmobs.annotate(undefined, {
-  inputData: String(message),
-  outputData: workflowResult.answer,
-  metadata: {
-    message: workflowResult.answer,
-  },
-});
+        llmobs.annotate(undefined, {
+          inputData: String(message),
+          outputData: workflowResult.answer,
+          metadata: {
+            message: workflowResult.answer,
+          },
+        });
 
         return workflowResult;
       }
     );
 
-    const responseBody = {
-      conversationId: conversation.id,
-      message: result.answer,
-      model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    const totalTokens =
+      Number(result.finalPromptTokens || 0) +
+      Number(result.finalCompletionTokens || 0);
+
+    const trace = {
+      model: result.finalModel || OPENAI_MODEL,
+      totalLatencyMs: result.finalLatencyMs,
+      totalTokens,
+      costEstimate: estimateCost({
+        promptTokens: result.finalPromptTokens,
+        completionTokens: result.finalCompletionTokens,
+      }),
       promptTokens: result.finalPromptTokens,
       completionTokens: result.finalCompletionTokens,
-      totalTokens:
-        (result.finalPromptTokens ?? 0) + (result.finalCompletionTokens ?? 0),
-      llmLatencyMs: result.finalLatencyMs,
       usedTools: result.usedTools,
       retrievalCount: result.retrievedChunks.length,
     };
 
-logger.info("chat_request_success", {
-  session_id: sessionId,
-  conversation_id: conversation.id,
-  "http.request.body": req.body,
-  "http.response.body": responseBody,
-});
+    const responseBody = {
+      conversationId: conversation.id,
+      message: {
+        id: result.assistantMessage?.id,
+        role: "assistant",
+        content: result.answer,
+        created_at: result.assistantMessage?.created_at,
+      },
+      trace,
+    };
+
+    logger.info("chat_request_success", {
+      user_id: userId,
+      conversation_id: conversation.id,
+      request_body: req.body,
+      response_body: responseBody,
+    });
+
     if (activeSpan) {
       setResponseBodyOnSpan(activeSpan, responseBody);
     }
 
     return res.json(responseBody);
   } catch (error) {
-    console.error("chat error:", error);
-
     logger.error("chat_request_failed", {
-      session_id: req.body?.sessionId || "unknown",
-      conversation_id: req.body?.conversationId || "unknown",
-      "http.request.body": req.body,
+      user_id: userId,
+      conversation_id: req.body?.conversationId || "new",
+      request_body: req.body,
       error_message: error.message,
       error_stack: error.stack,
     });
@@ -1162,12 +1298,13 @@ const port = Number(process.env.PORT || 3001);
 logger.info("app_starting", {
   port,
   embedding_model: EMBEDDING_MODEL,
-  openai_model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+  openai_model: OPENAI_MODEL,
   rag_chunk_size: RAG_CHUNK_SIZE,
   rag_chunk_overlap: RAG_CHUNK_OVERLAP,
   rag_top_k: RAG_TOP_K,
 });
 
+await initDatabase();
 await initRAG();
 
 app.listen(port, () => {

@@ -18,7 +18,7 @@ import {
   Radar,
 } from "lucide-react";
 
-const API_BASE_URL = "http://127.0.0.1:3001";
+const API_BASE_URL = "";
 
 const TEST_MODES = {
   NORMAL: "normal",
@@ -27,11 +27,94 @@ const TEST_MODES = {
   FRONTEND: "frontend",
 };
 
-const formatSeoulTime = (value = new Date()) =>
-  new Date(value).toLocaleTimeString("ko-KR", {
+const toSafeDate = (value) => {
+  if (!value) return new Date();
+
+  if (typeof value === "string") {
+    const normalized = value.includes(" ") ? value.replace(" ", "T") : value;
+    return new Date(normalized);
+  }
+
+  return new Date(value);
+};
+
+const pad2 = (num) => String(num).padStart(2, "0");
+
+const formatSeoulDateTime = (value = new Date()) => {
+  const date = toSafeDate(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
     hour12: false,
-  });
+  }).formatToParts(date);
+
+  const get = (type) => parts.find((part) => part.type === type)?.value || "";
+
+  const year = get("year");
+  const month = get("month");
+  const day = get("day");
+  const hour = get("hour");
+  const minute = get("minute");
+  const second = get("second");
+
+  return `${year}.${month}.${day} ${hour}:${minute}:${second}`;
+};
+
+const formatRelativeTime = (value) => {
+  const date = toSafeDate(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+
+  if (diffSec < 10) return "방금";
+  if (diffSec < 60) return `${diffSec}초 전`;
+
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}분 전`;
+
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `${diffHour}시간 전`;
+
+  const diffDay = Math.floor(diffHour / 24);
+  return `${diffDay}일 전`;
+};
+
+const buildTimestampLabel = (rawCreatedAt) => {
+  if (!rawCreatedAt) {
+    return formatSeoulDateTime(new Date());
+  }
+
+  const relative = formatRelativeTime(rawCreatedAt);
+  const absolute = formatSeoulDateTime(rawCreatedAt);
+
+  if (!relative) return absolute;
+  if (!absolute) return relative;
+
+  return `${relative} · ${absolute}`;
+};
+
+const makeLocalTimestamp = () => {
+  const now = new Date().toISOString();
+  return {
+    rawCreatedAt: now,
+    timestamp: buildTimestampLabel(now),
+  };
+};
 
 const initialMessages = [
   {
@@ -39,7 +122,7 @@ const initialMessages = [
     role: "assistant",
     content:
       "안녕하세요. 로그인 기반 Datadog 데모 채팅입니다. 질문을 입력하면 채팅과 함께 trace 정보가 오른쪽 패널에 표시됩니다.",
-    timestamp: formatSeoulTime(),
+    ...makeLocalTimestamp(),
   },
 ];
 
@@ -281,7 +364,11 @@ function AuthScreen({ onLoginSuccess }) {
     e.preventDefault();
     setError("");
 
-    if (!email.trim() || !password.trim() || (mode === "register" && !name.trim())) {
+    if (
+      !email.trim() ||
+      !password.trim() ||
+      (mode === "register" && !name.trim())
+    ) {
       setError(
         mode === "login"
           ? "이메일과 비밀번호를 입력해 주세요."
@@ -308,7 +395,9 @@ function AuthScreen({ onLoginSuccess }) {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data?.error || "요청 처리 중 오류가 발생했습니다.");
+        throw new Error(
+          data?.message || data?.error || "요청 처리 중 오류가 발생했습니다."
+        );
       }
 
       localStorage.setItem("authToken", data.token);
@@ -328,7 +417,7 @@ function AuthScreen({ onLoginSuccess }) {
 
       onLoginSuccess(data.user, data.token);
     } catch (err) {
-      setError(err.message || "로그인 처리 중 오류가 발생했습니다.");
+      setError(err?.message ?? "로그인 처리 중 오류가 발생했습니다.");
     } finally {
       setLoading(false);
     }
@@ -671,7 +760,8 @@ export default function App() {
           id: msg.id || `${msg.role}-${index}`,
           role: msg.role,
           content: msg.content,
-          timestamp: formatSeoulTime(msg.created_at),
+          rawCreatedAt: msg.created_at,
+          timestamp: buildTimestampLabel(msg.created_at),
         }));
 
       setMessages(restored.length > 0 ? restored : initialMessages);
@@ -751,6 +841,8 @@ export default function App() {
         method: "POST",
       });
     } catch (error) {
+      const localTime = makeLocalTimestamp();
+
       setErrorState(`네트워크 에러 발생: ${error.message}`);
       setMessages((prev) => [
         ...prev,
@@ -758,7 +850,7 @@ export default function App() {
           id: `net-${Date.now()}`,
           role: "assistant",
           content: `에러 발생: ${error.message}`,
-          timestamp: formatSeoulTime(),
+          ...localTime,
         },
       ]);
     }
@@ -787,11 +879,13 @@ export default function App() {
       return;
     }
 
+    const userTime = makeLocalTimestamp();
+
     const userMessage = {
       id: Date.now(),
       role: "user",
       content: trimmed,
-      timestamp: formatSeoulTime(),
+      ...userTime,
     };
 
     setMessages((prev) => [...prev, userMessage]);
@@ -826,19 +920,25 @@ export default function App() {
         setConversationId(data.conversationId);
       }
 
+      const assistantRawCreatedAt =
+        data?.message?.created_at || new Date().toISOString();
+
       setMessages((prev) => [
         ...prev,
         {
           id: data.message.id,
           role: "assistant",
           content: data.message.content,
-          timestamp: formatSeoulTime(data.message.created_at),
+          rawCreatedAt: assistantRawCreatedAt,
+          timestamp: buildTimestampLabel(assistantRawCreatedAt),
         },
       ]);
 
       setCurrentTrace(data.trace || null);
       loadConversations();
     } catch (error) {
+      const localTime = makeLocalTimestamp();
+
       setErrorState(error.message);
 
       setMessages((prev) => [
@@ -847,7 +947,7 @@ export default function App() {
           id: `err-${Date.now()}`,
           role: "assistant",
           content: `에러 발생: ${error.message}`,
-          timestamp: formatSeoulTime(),
+          ...localTime,
         },
       ]);
     } finally {
@@ -1486,84 +1586,84 @@ const styles = {
     lineHeight: 1.9,
   },
 
-authWrap: {
-  minHeight: "100svh",
-  background: "#f5f6f7",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  padding: 40,
-},
+  authWrap: {
+    minHeight: "100svh",
+    background: "#f5f6f7",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 40,
+  },
 
-authOuter: {
-  width: "100%",
-  display: "flex",
-  justifyContent: "center",
-  alignItems: "center",
-},
+  authOuter: {
+    width: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
 
-authCard: {
-  width: 372,
-  minHeight: 560,
-  background: "#fff",
-  borderRadius: 16,
-  border: "1px solid #dbdbdb",
-  boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
-  padding: "58px 32px 44px",
-  display: "flex",
-  flexDirection: "column",
-  justifyContent: "flex-start",
-},
+  authCard: {
+    width: 372,
+    minHeight: 560,
+    background: "#fff",
+    borderRadius: 16,
+    border: "1px solid #dbdbdb",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
+    padding: "58px 32px 44px",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "flex-start",
+  },
 
-authBrand: {
-  textAlign: "center",
-  fontSize: 30,
-  fontWeight: 800,
-  color: "#111827",
-  letterSpacing: "-0.5px",
-  marginBottom: 36,
-},
+  authBrand: {
+    textAlign: "center",
+    fontSize: 30,
+    fontWeight: 800,
+    color: "#111827",
+    letterSpacing: "-0.5px",
+    marginBottom: 36,
+  },
 
-authIntro: {
-  textAlign: "center",
-  marginBottom: 42,
-},
+  authIntro: {
+    textAlign: "center",
+    marginBottom: 42,
+  },
 
-authSubtitleSolo: {
-  fontSize: 14,
-  color: "#6b7280",
-  lineHeight: 1.7,
-},
+  authSubtitleSolo: {
+    fontSize: 14,
+    color: "#6b7280",
+    lineHeight: 1.7,
+  },
 
-authTitle: {
-  margin: 0,
-  fontSize: 22,
-  fontWeight: 700,
-  color: "#111827",
-},
+  authTitle: {
+    margin: 0,
+    fontSize: 22,
+    fontWeight: 700,
+    color: "#111827",
+  },
 
-authSubtitle: {
-  marginTop: 12,
-  fontSize: 13,
-  color: "#6b7280",
-  lineHeight: 1.6,
-},
+  authSubtitle: {
+    marginTop: 12,
+    fontSize: 13,
+    color: "#6b7280",
+    lineHeight: 1.6,
+  },
 
-authForm: {
-  display: "grid",
-  gap: 16,
-},
+  authForm: {
+    display: "grid",
+    gap: 16,
+  },
 
-authInput: {
-  height: 46,
-  borderRadius: 8,
-  border: "1px solid #dbdbdb",
-  background: "#fafafa",
-  padding: "0 14px",
-  fontSize: 14,
-  outline: "none",
-  transition: "all 0.15s ease",
-},
+  authInput: {
+    height: 46,
+    borderRadius: 8,
+    border: "1px solid #dbdbdb",
+    background: "#fafafa",
+    padding: "0 14px",
+    fontSize: 14,
+    outline: "none",
+    transition: "all 0.15s ease",
+  },
   authError: {
     padding: "12px 14px",
     borderRadius: 12,
@@ -1573,51 +1673,51 @@ authInput: {
     fontSize: 13,
     lineHeight: 1.5,
   },
-authSubmit: {
-  height: 42,
-  borderRadius: 8,
-  border: "none",
-  background: "#4da3ff",
-  color: "#fff",
-  fontWeight: 700,
-  fontSize: 14,
-  cursor: "pointer",
-  marginTop: 12,
-  transition: "all 0.18s ease",
-},
+  authSubmit: {
+    height: 42,
+    borderRadius: 8,
+    border: "none",
+    background: "#4da3ff",
+    color: "#fff",
+    fontWeight: 700,
+    fontSize: 14,
+    cursor: "pointer",
+    marginTop: 12,
+    transition: "all 0.18s ease",
+  },
   authSubmitDisabled: {
     opacity: 0.72,
     cursor: "not-allowed",
   },
-authDivider: {
-  display: "flex",
-  alignItems: "center",
-  gap: 14,
-  margin: "36px 0 28px",
-},
-authDividerLine: {
-  flex: 1,
-  height: 1,
-  background: "#e5e7eb",
-},
+  authDivider: {
+    display: "flex",
+    alignItems: "center",
+    gap: 14,
+    margin: "36px 0 28px",
+  },
+  authDividerLine: {
+    flex: 1,
+    height: 1,
+    background: "#e5e7eb",
+  },
 
-authDividerText: {
-  fontSize: 12,
-  fontWeight: 700,
-  color: "#9ca3af",
-},
+  authDividerText: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#9ca3af",
+  },
 
-authGhostButton: {
-  width: "100%",
-  border: "none",
-  background: "transparent",
-  color: "#2563eb",
-  fontWeight: 600,
-  fontSize: 14,
-  cursor: "pointer",
-  marginTop: "auto",
-  paddingTop: 12,
-},
+  authGhostButton: {
+    width: "100%",
+    border: "none",
+    background: "transparent",
+    color: "#2563eb",
+    fontWeight: 600,
+    fontSize: 14,
+    cursor: "pointer",
+    marginTop: "auto",
+    paddingTop: 12,
+  },
 
   modalBackdrop: {
     position: "fixed",

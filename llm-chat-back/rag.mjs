@@ -13,11 +13,9 @@ function ensureDir(dirPath) {
 
 export async function loadDocuments() {
   const docsDir = path.join(process.cwd(), "docs");
-
   ensureDir(docsDir);
 
   const files = fs.readdirSync(docsDir);
-
   const documents = [];
 
   for (const file of files) {
@@ -33,7 +31,7 @@ export async function loadDocuments() {
       id: file,
       text,
       path: fullPath,
-      updatedAt: stat.mtime.toISOString(),
+      updatedAt: stat.mtime.toISOString()
     });
   }
 
@@ -41,9 +39,7 @@ export async function loadDocuments() {
 }
 
 export function splitChunks(text, chunkSize = 1000, overlap = 150) {
-  if (!text || !text.trim()) {
-    return [];
-  }
+  if (!text || !text.trim()) return [];
 
   const normalized = text.replace(/\r\n/g, "\n").trim();
   const chunks = [];
@@ -53,10 +49,7 @@ export function splitChunks(text, chunkSize = 1000, overlap = 150) {
     const end = Math.min(start + chunkSize, normalized.length);
     const chunk = normalized.slice(start, end).trim();
 
-    if (chunk) {
-      chunks.push(chunk);
-    }
-
+    if (chunk) chunks.push(chunk);
     if (end >= normalized.length) break;
 
     start = Math.max(end - overlap, start + 1);
@@ -94,10 +87,7 @@ export function cosineSimilarity(a, b) {
     normB += bv * bv;
   }
 
-  if (normA === 0 || normB === 0) {
-    return 0;
-  }
-
+  if (normA === 0 || normB === 0) return 0;
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
@@ -109,7 +99,7 @@ export function loadEmbeddingCache() {
       version: 1,
       embeddingModel: null,
       updatedAt: null,
-      chunks: {},
+      chunks: {}
     };
   }
 
@@ -121,14 +111,14 @@ export function loadEmbeddingCache() {
       version: parsed.version ?? 1,
       embeddingModel: parsed.embeddingModel ?? null,
       updatedAt: parsed.updatedAt ?? null,
-      chunks: parsed.chunks ?? {},
+      chunks: parsed.chunks ?? {}
     };
   } catch {
     return {
       version: 1,
       embeddingModel: null,
       updatedAt: null,
-      chunks: {},
+      chunks: {}
     };
   }
 }
@@ -156,7 +146,7 @@ export function buildChunkRecords(docs, chunkSize = 1000, overlap = 150) {
         text,
         hash,
         chunkIndex: i,
-        docUpdatedAt: doc.updatedAt,
+        docUpdatedAt: doc.updatedAt
       });
     }
   }
