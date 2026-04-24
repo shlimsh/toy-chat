@@ -61,6 +61,21 @@ const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
   CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -91,6 +106,12 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_messages_created_at
     ON messages(created_at);
+
+  CREATE INDEX IF NOT EXISTS idx_users_email
+    ON users(email);
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_user_id
+    ON sessions(user_id);
 `);
 
 /**
@@ -120,6 +141,12 @@ function generateId(prefix = "id") {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function hashPassword(password) {
+  const safePassword = String(password ?? "");
+  const salt = process.env.AUTH_PASSWORD_SALT || "toy-chat-demo-salt";
+  return crypto.createHash("sha256").update(`${salt}:${safePassword}`).digest("hex");
 }
 
 function safeJsonParse(value, fallback = {}) {
@@ -353,6 +380,96 @@ function getConversationsBySessionId(sessionId) {
   `);
 
   return stmt.all(sessionId);
+}
+
+function sanitizeUser(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    created_at: row.created_at,
+  };
+}
+
+function getUserByEmail(email) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM users
+    WHERE email = ?
+  `);
+
+  return stmt.get(email);
+}
+
+function createUser({ name, email, passwordHash }) {
+  const createdAt = nowIso();
+  const stmt = db.prepare(`
+    INSERT INTO users (name, email, password_hash, created_at)
+    VALUES (?, ?, ?, ?)
+  `);
+  const result = stmt.run(name, email, passwordHash, createdAt);
+
+  return {
+    id: result.lastInsertRowid,
+    name,
+    email,
+    created_at: createdAt,
+  };
+}
+
+function getSessionWithUser(token) {
+  const stmt = db.prepare(`
+    SELECT
+      s.token,
+      s.created_at AS session_created_at,
+      u.id,
+      u.name,
+      u.email,
+      u.created_at
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token = ?
+  `);
+
+  return stmt.get(token);
+}
+
+function createSession(userId) {
+  const token = `tok_${crypto.randomUUID()}`;
+  const createdAt = nowIso();
+  const stmt = db.prepare(`
+    INSERT INTO sessions (token, user_id, created_at)
+    VALUES (?, ?, ?)
+  `);
+  stmt.run(token, userId, createdAt);
+  return token;
+}
+
+function extractBearerToken(authorizationHeader) {
+  const safeHeader = String(authorizationHeader ?? "");
+  if (!safeHeader.toLowerCase().startsWith("bearer ")) return null;
+  const token = safeHeader.slice(7).trim();
+  return token || null;
+}
+
+function requireAuth(req, res, next) {
+  const token = extractBearerToken(req.headers?.authorization);
+
+  if (!token) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const session = getSessionWithUser(token);
+  if (!session) {
+    return res.status(401).json({ error: "invalid session" });
+  }
+
+  req.user = sanitizeUser(session);
+  req.authSessionId = `user_${session.id}`;
+
+  return next();
 }
 
 /**
@@ -615,14 +732,86 @@ app.get("/health", (_req, res) => {
   return res.json({ ok: true });
 });
 
+app.post("/auth/register", (req, res) => {
+  try {
+    const { name, email, password } = req.body ?? {};
+    const safeName = String(name ?? "").trim();
+    const safeEmail = String(email ?? "").trim().toLowerCase();
+    const safePassword = String(password ?? "");
+
+    if (!safeName || !safeEmail || !safePassword) {
+      return res
+        .status(400)
+        .json({ error: "name, email and password are required" });
+    }
+
+    const existingUser = getUserByEmail(safeEmail);
+    if (existingUser) {
+      return res.status(409).json({ error: "email already exists" });
+    }
+
+    const user = createUser({
+      name: safeName,
+      email: safeEmail,
+      passwordHash: hashPassword(safePassword),
+    });
+    const token = createSession(user.id);
+
+    return res.status(201).json({
+      token,
+      user: sanitizeUser(user),
+    });
+  } catch (error) {
+    logger.error("auth_register_failed", {
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+    return res.status(500).json({ error: "internal server error" });
+  }
+});
+
+app.post("/auth/login", (req, res) => {
+  try {
+    const { email, password } = req.body ?? {};
+    const safeEmail = String(email ?? "").trim().toLowerCase();
+    const safePassword = String(password ?? "");
+
+    if (!safeEmail || !safePassword) {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+
+    const user = getUserByEmail(safeEmail);
+    if (!user || user.password_hash !== hashPassword(safePassword)) {
+      return res.status(401).json({ error: "invalid credentials" });
+    }
+
+    const token = createSession(user.id);
+    return res.json({
+      token,
+      user: sanitizeUser(user),
+    });
+  } catch (error) {
+    logger.error("auth_login_failed", {
+      error_message: error.message,
+      error_stack: error.stack,
+    });
+    return res.status(500).json({ error: "internal server error" });
+  }
+});
+
+app.get("/auth/me", requireAuth, (req, res) => {
+  return res.json({ user: req.user });
+});
+
 /**
  * 대화 목록 조회
  */
-app.get("/conversations", (req, res) => {
+app.get("/conversations", requireAuth, (req, res) => {
   try {
     const { sessionId, forceError } = req.query;
+    const effectiveSessionId = String(sessionId ?? "").trim() || req.authSessionId;
 
-    if (!sessionId) {
+    if (!effectiveSessionId) {
       return res.status(400).json({ error: "sessionId is required" });
     }
 
@@ -642,15 +831,15 @@ if (span) {
 }
 
     logger.info("conversations_request_received", {
-      session_id: sessionId,
+      session_id: effectiveSessionId,
       query: req.query,
     });
 
-    const conversations = getConversationsBySessionId(sessionId);
+    const conversations = getConversationsBySessionId(effectiveSessionId);
     const responseBody = { conversations };
 
     logger.info("conversations_request_success", {
-      session_id: sessionId,
+      session_id: effectiveSessionId,
       response_body: responseBody,
     });
 
@@ -681,13 +870,18 @@ if (span) {
 /**
  * 특정 대화 메시지 조회
  */
-app.get("/conversations/:conversationId/messages", (req, res) => {
+app.get("/conversations/:conversationId/messages", requireAuth, (req, res) => {
   try {
     const { conversationId } = req.params;
     const { forceError } = req.query;
+    const conversation = getConversationById(conversationId);
 
     if (String(forceError) === "true") {
       throw new Error("Intentional conversation messages error for demo");
+    }
+
+    if (!conversation || conversation.session_id !== req.authSessionId) {
+      return res.status(404).json({ error: "conversation not found" });
     }
 
 const span = tracer.scope().active();
@@ -745,9 +939,11 @@ if (span) {
 /**
  * 채팅
  */
-app.post("/chat", async (req, res) => {
+app.post("/chat", requireAuth, async (req, res) => {
   const requestSpan = tracer.scope().active();
   const { sessionId, conversationId, message, forceError } = req.body ?? {};
+  const effectiveSessionId =
+    String(sessionId ?? "").trim() || req.authSessionId || null;
 
   try {
     if (forceError === true) {
@@ -762,7 +958,7 @@ app.post("/chat", async (req, res) => {
       }
 
       logger.error("chat_request_failed", {
-        session_id: sessionId || "unknown",
+        session_id: effectiveSessionId || "unknown",
         conversation_id: conversationId || "unknown",
         "http.request.body": req.body,
         error_message: error.message,
@@ -774,7 +970,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    if (!sessionId) {
+    if (!effectiveSessionId) {
       return res.status(400).json({ error: "sessionId is required" });
     }
 
@@ -783,7 +979,7 @@ app.post("/chat", async (req, res) => {
     }
 
     logger.info("chat_request_received", {
-      session_id: sessionId,
+      session_id: effectiveSessionId,
       conversation_id: conversationId || "new",
       request_body: req.body,
     });
@@ -796,9 +992,13 @@ app.post("/chat", async (req, res) => {
       if (!conversation) {
         return res.status(404).json({ error: "conversation not found" });
       }
+
+      if (conversation.session_id !== effectiveSessionId) {
+        return res.status(404).json({ error: "conversation not found" });
+      }
     } else {
       conversation = createConversation({
-        sessionId,
+        sessionId: effectiveSessionId,
         title: String(message).slice(0, 30),
       });
     }
@@ -822,7 +1022,7 @@ if (activeSpan) {
       {
         kind: "agent",
         name: "chat_agent",
-        sessionId,
+        sessionId: effectiveSessionId,
         mlApp: ML_APP,
       },
       async () => {
@@ -830,7 +1030,7 @@ if (activeSpan) {
           {
             kind: "workflow",
             name: "process_chat_request",
-            sessionId,
+            sessionId: effectiveSessionId,
             mlApp: ML_APP,
           },
           async () => {
@@ -871,7 +1071,7 @@ IMPORTANT RULES:
             const intent = classifyUserIntent(String(message));
 
             logger.info("chat_intent_classified", {
-              session_id: sessionId,
+              session_id: effectiveSessionId,
               conversation_id: conversation.id,
               need_time_tool: intent.needTimeTool,
               need_docs: intent.needDocs,
@@ -881,7 +1081,7 @@ IMPORTANT RULES:
 
             if (intent.needDocs) {
               logger.info("chat_before_query_embedding", {
-                session_id: sessionId,
+                session_id: effectiveSessionId,
                 conversation_id: conversation.id,
                 message_preview: String(message).slice(0, 120),
               });
@@ -889,7 +1089,7 @@ IMPORTANT RULES:
               const queryEmbedding = await embedUserQuery(String(message));
 
               logger.info("chat_after_query_embedding", {
-                session_id: sessionId,
+                session_id: effectiveSessionId,
                 conversation_id: conversation.id,
                 embedding_length: queryEmbedding.length,
               });
@@ -901,7 +1101,7 @@ IMPORTANT RULES:
               });
 
               logger.info("chat_retrieval_completed", {
-                session_id: sessionId,
+                session_id: effectiveSessionId,
                 conversation_id: conversation.id,
                 retrieval_count: retrievedChunks.length,
                 retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
@@ -985,7 +1185,7 @@ IMPORTANT RULES:
                 }
 
                 logger.info("chat_tool_executed", {
-                  session_id: sessionId,
+                  session_id: effectiveSessionId,
                   conversation_id: conversation.id,
                   tool_name: toolName,
                   tool_args: parsedArgs,
@@ -1028,7 +1228,7 @@ IMPORTANT RULES:
                 "응답이 비어 있습니다.";
             }
 
-            createMessage({
+            const assistantMessage = createMessage({
               conversationId: conversation.id,
               role: "assistant",
               content: answer,
@@ -1047,7 +1247,7 @@ IMPORTANT RULES:
             });
 
             logger.info("chat_request_completed", {
-              session_id: sessionId,
+              session_id: effectiveSessionId,
               conversation_id: conversation.id,
               model: finalModel,
               latency_ms: finalLatencyMs,
@@ -1084,6 +1284,7 @@ llmobs.annotate(undefined, {
 });
 
             return {
+              assistantMessage,
               answer,
               finalModel,
               finalPromptTokens,
@@ -1109,7 +1310,12 @@ llmobs.annotate(undefined, {
 
     const responseBody = {
       conversationId: conversation.id,
-      message: result.answer,
+      message: {
+        id: result.assistantMessage?.id,
+        role: result.assistantMessage?.role || "assistant",
+        content: result.assistantMessage?.content || result.answer,
+        created_at: result.assistantMessage?.created_at || nowIso(),
+      },
       model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
       promptTokens: result.finalPromptTokens,
       completionTokens: result.finalCompletionTokens,
@@ -1118,10 +1324,17 @@ llmobs.annotate(undefined, {
       llmLatencyMs: result.finalLatencyMs,
       usedTools: result.usedTools,
       retrievalCount: result.retrievedChunks.length,
+      trace: {
+        model: result.finalModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+        totalLatencyMs: result.finalLatencyMs,
+        totalTokens:
+          (result.finalPromptTokens ?? 0) + (result.finalCompletionTokens ?? 0),
+        costEstimate: null,
+      },
     };
 
 logger.info("chat_request_success", {
-  session_id: sessionId,
+  session_id: effectiveSessionId,
   conversation_id: conversation.id,
   "http.request.body": req.body,
   "http.response.body": responseBody,
@@ -1135,7 +1348,7 @@ logger.info("chat_request_success", {
     console.error("chat error:", error);
 
     logger.error("chat_request_failed", {
-      session_id: req.body?.sessionId || "unknown",
+      session_id: effectiveSessionId || "unknown",
       conversation_id: req.body?.conversationId || "unknown",
       "http.request.body": req.body,
       error_message: error.message,
