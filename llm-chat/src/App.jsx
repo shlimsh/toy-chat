@@ -926,9 +926,9 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         {
-          id: data.message.id,
+          id: data?.message?.id ?? `assistant-${Date.now()}`,
           role: "assistant",
-          content: data.message.content,
+          content: data?.message?.content ?? "응답이 비어 있습니다.",
           rawCreatedAt: assistantRawCreatedAt,
           timestamp: buildTimestampLabel(assistantRawCreatedAt),
         },

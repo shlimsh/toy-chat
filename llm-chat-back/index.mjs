@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import OpenAI from "openai";
 import crypto from "crypto";
 import tracer from "dd-trace";
@@ -36,7 +37,25 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .map((v) => v.trim())
   .filter(Boolean);
 
-app.use(express.json());
+if (allowedOrigins.length > 0) {
+  app.use(
+    cors({
+      origin(origin, cb) {
+        // 같은 오리진 또는 비-브라우저 요청(origin 없음)은 허용
+        if (!origin) return cb(null, true);
+        if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+          return cb(null, true);
+        }
+        return cb(new Error(`Origin ${origin} not allowed by CORS`));
+      },
+      credentials: true,
+    })
+  );
+
+  logger.info("cors_enabled", { allowed_origins: allowedOrigins });
+}
+
+app.use(express.json({ limit: "1mb" }));
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -93,6 +112,16 @@ function safeStringify(value) {
   }
 }
 
+const SPAN_BODY_TAG_MAX = Number(process.env.SPAN_BODY_TAG_MAX || 8192);
+
+function truncateForSpan(str) {
+  if (typeof str !== "string") return str;
+  if (str.length <= SPAN_BODY_TAG_MAX) return str;
+  return `${str.slice(0, SPAN_BODY_TAG_MAX)}...[truncated ${
+    str.length - SPAN_BODY_TAG_MAX
+  } chars]`;
+}
+
 function shouldUseTimeTool(message) {
   return /현재 시간|지금 시간|몇 시|시각|time/i.test(String(message));
 }
@@ -103,12 +132,12 @@ function shouldUseDocs(message) {
 
 function setRequestBodyOnSpan(span, body) {
   if (!span) return;
-  span.setTag("http.request.body", safeStringify(body));
+  span.setTag("http.request.body", truncateForSpan(safeStringify(body)));
 }
 
 function setResponseBodyOnSpan(span, body) {
   if (!span) return;
-  span.setTag("http.response.body", safeStringify(body));
+  span.setTag("http.response.body", truncateForSpan(safeStringify(body)));
 }
 
 function markSpanError(error, extraTags = {}) {
@@ -1249,10 +1278,11 @@ IMPORTANT RULES:
     const responseBody = {
       conversationId: conversation.id,
       message: {
-        id: result.assistantMessage?.id,
+        id: result.assistantMessage?.id ?? `assistant-${Date.now()}`,
         role: "assistant",
         content: result.answer,
-        created_at: result.assistantMessage?.created_at,
+        created_at:
+          result.assistantMessage?.created_at ?? new Date().toISOString(),
       },
       trace,
     };
@@ -1304,8 +1334,27 @@ logger.info("app_starting", {
   rag_top_k: RAG_TOP_K,
 });
 
-await initDatabase();
-await initRAG();
+try {
+  await initDatabase();
+} catch (error) {
+  logger.error("db_init_failed", {
+    error_message: error.message,
+    error_stack: error.stack,
+  });
+  console.error("FATAL: failed to initialize database:", error.message);
+  process.exit(1);
+}
+
+try {
+  await initRAG();
+} catch (error) {
+  logger.error("rag_init_failed", {
+    error_message: error.message,
+    error_stack: error.stack,
+  });
+  console.error("FATAL: failed to initialize RAG index:", error.message);
+  process.exit(1);
+}
 
 app.listen(port, () => {
   logger.info("app_listening", {

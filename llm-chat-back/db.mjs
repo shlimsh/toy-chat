@@ -1,12 +1,20 @@
 import mysql from "mysql2/promise";
 import logger from "./logger.mjs";
 
-const pool = mysql.createPool({
-  host: process.env.MYSQL_HOST || "192.168.16.153",
-  port: Number(process.env.MYSQL_PORT || 3306),
-  user: process.env.MYSQL_USER || "toy_chat_user",
-  password: process.env.MYSQL_PASSWORD || "1234",
-  database: process.env.MYSQL_DATABASE || "toy_chat",
+const DB_HOST = process.env.MYSQL_HOST || "127.0.0.1";
+const DB_PORT = Number(process.env.MYSQL_PORT || 3306);
+const DB_USER = process.env.MYSQL_USER || "toy_chat_user";
+const DB_PASSWORD = process.env.MYSQL_PASSWORD || "";
+const DB_NAME = process.env.MYSQL_DATABASE || "toy_chat";
+const DB_SSL_ENABLED =
+  String(process.env.MYSQL_SSL || "").toLowerCase() === "true";
+
+const poolConfig = {
+  host: DB_HOST,
+  port: DB_PORT,
+  user: DB_USER,
+  password: DB_PASSWORD,
+  database: DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -14,10 +22,17 @@ const pool = mysql.createPool({
   connectTimeout: 10000,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
+};
+
+if (DB_SSL_ENABLED) {
+  poolConfig.ssl = {
+    rejectUnauthorized:
+      String(process.env.MYSQL_SSL_REJECT_UNAUTHORIZED || "true").toLowerCase() !==
+      "false",
+  };
+}
+
+const pool = mysql.createPool(poolConfig);
 
 export async function query(sql, params = []) {
   const [rows] = await pool.execute(sql, params);
@@ -26,10 +41,11 @@ export async function query(sql, params = []) {
 
 export async function initDatabase() {
   logger.info("db_connect_try", {
-    host: process.env.MYSQL_HOST || "192.168.16.153",
-    port: Number(process.env.MYSQL_PORT || 3306),
-    user: process.env.MYSQL_USER || "toy_chat_user",
-    database: process.env.MYSQL_DATABASE || "toy_chat",
+    host: DB_HOST,
+    port: DB_PORT,
+    user: DB_USER,
+    database: DB_NAME,
+    ssl: DB_SSL_ENABLED,
   });
 
   await query(`
@@ -66,13 +82,14 @@ export async function initDatabase() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT fk_messages_conversation
         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+      INDEX idx_messages_conversation_created (conversation_id, created_at)
     )
   `);
 
   logger.info("db_initialized", {
-    db_host: process.env.MYSQL_HOST || "192.168.16.153",
-    db_name: process.env.MYSQL_DATABASE || "toy_chat",
+    db_host: DB_HOST,
+    db_name: DB_NAME,
   });
 }
 
