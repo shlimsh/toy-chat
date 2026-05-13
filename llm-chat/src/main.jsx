@@ -20,16 +20,16 @@ datadogRum.init({
   defaultPrivacyLevel: "mask-user-input",
   allowedTracingUrls: [
     {
-    match: /\/(auth|chat|conversations|health)(\/|$)/,
-    propagatorTypes: ["tracecontext", "datadog"],
+      match: /\/(auth|chat|conversations|health)(\/|$)/,
+      propagatorTypes: ["tracecontext", "datadog"],
     },
   ],
-    plugins: [reactPlugin()],
-    beforeSend: (event) => {
-      console.log("RUM event:", event.type, event);
-      return true;
-    },
-  });
+  plugins: [reactPlugin()],
+  beforeSend: (event) => {
+    console.log("RUM event:", event.type, event);
+    return true;
+  },
+});
 
 datadogLogs.init({
   clientToken: "pub449df5722fca21cfef9b38fe276703ea",
