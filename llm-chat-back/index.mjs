@@ -4,6 +4,7 @@ import cors from "cors";
 import OpenAI from "openai";
 import crypto from "crypto";
 import tracer from "dd-trace";
+import * as datadogApiClient from "@datadog/datadog-api-client";
 import logger from "./logger.mjs";
 import { query, initDatabase } from "./db.mjs";
 import {
@@ -41,19 +42,28 @@ if (allowedOrigins.length > 0) {
   app.use(
     cors({
       origin(origin, cb) {
-        // 같은 오리진 또는 비-브라우저 요청(origin 없음)은 허용
         if (!origin) return cb(null, true);
-        if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+
+        if (
+          allowedOrigins.includes("*") ||
+          allowedOrigins.includes(origin)
+        ) {
           return cb(null, true);
         }
-        return cb(new Error(`Origin ${origin} not allowed by CORS`));
+
+        return cb(
+          new Error(`Origin ${origin} not allowed by CORS`)
+        );
       },
       credentials: true,
     })
   );
-
-  logger.info("cors_enabled", { allowed_origins: allowedOrigins });
 }
+
+app.use((req, res, next) => {
+  res.setHeader("Timing-Allow-Origin", "*");
+  next();
+});
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -61,10 +71,27 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const ddConfig = datadogApiClient.client.createConfiguration({
+  authMethods: {
+    apiKeyAuth: process.env.DD_API_KEY?.trim(),
+    appKeyAuth: process.env.DD_APP_KEY?.trim(),
+  },
+});
+
+ddConfig.setServerVariables({
+  site: process.env.DD_SITE || "datadoghq.com",
+});
+
+const incidentsApi =
+  new datadogApiClient.v2.IncidentsApi(ddConfig);
+
+const metricsApi =
+  new datadogApiClient.v1.MetricsApi(ddConfig);
+
 const EMBEDDING_MODEL =
   process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 const RAG_CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE || 1000);
 const RAG_CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP || 150);
 const RAG_TOP_K = Number(process.env.RAG_TOP_K || 3);
@@ -537,8 +564,10 @@ const getCurrentTimeTool = llmobs.wrap(
   { kind: "tool", name: "get_current_time" },
   function getCurrentTimeTool() {
     const result = {
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      localTime: new Date().toLocaleString(),
+      timezone: "Asia/Seoul",
+      localTime: new Date().toLocaleString("ko-KR", {
+        timeZone: "Asia/Seoul",
+      }),
       epochMs: Date.now(),
     };
 
@@ -548,6 +577,94 @@ const getCurrentTimeTool = llmobs.wrap(
     });
 
     return result;
+  }
+);
+
+const queryDatadogTool = llmobs.wrap(
+  { kind: "tool", name: "query_datadog" },
+  async function queryDatadogTool(queryText) {
+    try {
+      const query = String(queryText || "").toLowerCase();
+
+      //
+      // CPU 높은 서버 조회
+      //
+      if (
+        query.includes("cpu") ||
+        query.includes("씨피유") ||
+        query.includes("서버")
+      ) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const fromSec = nowSec - 5 * 60;
+
+        const result = await metricsApi.queryMetrics({
+          from: fromSec,
+          to: nowSec,
+          query: "top(avg:system.cpu.user{*} by {host}, 10, 'mean', 'desc')",
+        });
+
+        const series = result.series || [];
+
+        return {
+          source: "datadog",
+          type: "metrics",
+          metric: "system.cpu.user",
+          time_range: "last_5_minutes",
+          query:
+            "top(avg:system.cpu.user{*} by {host}, 10, 'mean', 'desc')",
+          count: series.length,
+          hosts: series.map((item) => {
+            const pointlist = item.pointlist || [];
+            const values = pointlist
+              .map((point) => point?.[1])
+              .filter((value) => typeof value === "number");
+
+            const avg =
+              values.length > 0
+                ? values.reduce((sum, value) => sum + value, 0) / values.length
+                : null;
+
+            return {
+              scope: item.scope,
+              display_name: item.displayName,
+              avg_cpu_user_percent:
+                avg === null ? null : Number(avg.toFixed(2)),
+            };
+          }),
+        };
+      }
+
+      //
+      // Incident 조회
+      //
+      if (
+        query.includes("incident") ||
+        query.includes("장애") ||
+        query.includes("문제")
+      ) {
+        const result =
+          await incidentsApi.listIncidents();
+
+        return {
+          source: "datadog",
+          type: "incidents",
+          count: result.data?.length || 0,
+          incidents:
+            result.data?.slice(0, 5) || [],
+        };
+      }
+
+      return {
+        source: "datadog",
+        message:
+          "현재는 Incident 조회만 지원합니다.",
+      };
+    } catch (error) {
+      return {
+        source: "datadog",
+        error: error.message,
+      };
+    }
   }
 );
 
@@ -630,8 +747,35 @@ function buildToolDefinitions() {
         },
       },
     },
+
+    {
+      type: "function",
+      function: {
+        name: "query_datadog",
+
+        description:
+          "Query Datadog incidents and observability data",
+
+        parameters: {
+          type: "object",
+
+          properties: {
+            query: {
+              type: "string",
+            },
+          },
+
+          required: ["query"],
+
+          additionalProperties: false,
+        },
+      },
+    },
   ];
 }
+
+
+
 
 function estimateCost({ promptTokens = 0, completionTokens = 0 }) {
   const inputCostPer1M = 0.4;
@@ -647,8 +791,266 @@ function estimateCost({ promptTokens = 0, completionTokens = 0 }) {
 /**
  * 헬스체크
  */
-app.get("/health", (_req, res) => {
-  return res.json({ ok: true });
+app.get("/monitoring/test", (_req, res) => {
+  return res.json({
+    ok: true,
+    message: "monitoring route alive",
+  });
+});
+
+function monitoringGetTodayRangeSecKST() {
+  const now = new Date();
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+
+  const from = new Date(`${y}-${m}-${d}T00:00:00+09:00`);
+
+  return {
+    fromSec: Math.floor(from.getTime() / 1000),
+    toSec: Math.floor(now.getTime() / 1000),
+  };
+}
+
+function monitoringGetHostFromScope(scope = "") {
+  const match = String(scope).match(/host:([^,\s]+)/);
+  return match?.[1] || "unknown";
+}
+
+function monitoringGetResourceFromScope(scope = "") {
+  const match =
+    String(scope).match(/resource_name:([^,\s]+)/) ||
+    String(scope).match(/resource:([^,\s]+)/);
+
+  return match?.[1] || "unknown";
+}
+
+function monitoringGetSeriesValues(pointlist = []) {
+  return pointlist
+    .map((point) => point?.[1])
+    .filter((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+function monitoringAverage(values = []) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function monitoringTotal(values = []) {
+  return values.reduce((sum, value) => sum + value, 0);
+}
+
+function monitoringGetAllValues(result) {
+  return (result.series || []).flatMap((item) =>
+    monitoringGetSeriesValues(item.pointlist || [])
+  );
+}
+
+function monitoringFormatPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  return `${Number(value).toFixed(1)}%`;
+}
+
+function monitoringFormatLatency(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+
+  const num = Number(value);
+
+  if (num < 1) {
+    return `${(num * 1000).toFixed(0)} ms`;
+  }
+
+  return `${num.toFixed(2)} s`;
+}
+
+function monitoringGetTopCpuHosts(result, limit = 3) {
+  return (result.series || [])
+    .map((item) => {
+      const idleAvg = monitoringAverage(
+        monitoringGetSeriesValues(item.pointlist || [])
+      );
+
+      const idlePercent =
+        idleAvg === null ? null : idleAvg <= 1 ? idleAvg * 100 : idleAvg;
+
+      const usage = idlePercent === null ? null : 100 - idlePercent;
+
+      return {
+        host: monitoringGetHostFromScope(item.scope),
+        value: usage,
+        displayValue: monitoringFormatPercent(usage),
+      };
+    })
+    .filter((item) => item.value !== null)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
+function monitoringGetTopMemoryHosts(result, limit = 3) {
+  return (result.series || [])
+    .map((item) => {
+      const usableAvgRaw = monitoringAverage(
+        monitoringGetSeriesValues(item.pointlist || [])
+      );
+
+      const usableAvg =
+        usableAvgRaw === null
+          ? null
+          : usableAvgRaw <= 1
+          ? usableAvgRaw * 100
+          : usableAvgRaw;
+
+      const usage = usableAvg === null ? null : 100 - usableAvg;
+
+      return {
+        host: monitoringGetHostFromScope(item.scope),
+        value: usage,
+        displayValue: monitoringFormatPercent(usage),
+      };
+    })
+    .filter((item) => item.value !== null)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
+function monitoringGetTopLatencyResources(result, limit = 3) {
+  return (result.series || [])
+    .map((item) => {
+      const latencyAvg = monitoringAverage(
+        monitoringGetSeriesValues(item.pointlist || [])
+      );
+
+      return {
+        resource: monitoringGetResourceFromScope(item.scope),
+        value: latencyAvg,
+        displayValue: monitoringFormatLatency(latencyAvg),
+      };
+    })
+    .filter((item) => item.value !== null)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
+app.get("/api/monitoring/summary", async (req, res) => {
+  console.log("MONITORING API START");
+  try {
+    const { fromSec, toSec } = monitoringGetTodayRangeSecKST();
+
+    const visitorsService = "shlim-toy-chat-front";
+
+    const [cpuIdleResult, memoryUsableResult, latencyResult, visitorsResult] =
+      await Promise.all([
+        metricsApi.queryMetrics({
+          from: fromSec,
+          to: toSec,
+          query: "avg:system.cpu.idle{*} by {host}",
+        }),
+        metricsApi.queryMetrics({
+          from: fromSec,
+          to: toSec,
+          query: "avg:system.mem.pct_usable{*} by {host}",
+        }),
+        metricsApi.queryMetrics({
+          from: fromSec,
+          to: toSec,
+          query:
+            "avg:trace.express.request{env:dev,service:shlim-toy-chat-api} by {resource_name}",
+        }),
+        metricsApi.queryMetrics({
+          from: fromSec,
+          to: toSec,
+          query:
+            "sum:custom.user{*} by {usr.name}.as_count()",
+        }),
+      ]);
+
+      console.log("===== VISITORS RESULT =====");
+      console.log(JSON.stringify(visitorsResult, null, 2));
+
+    const topCpuHosts = monitoringGetTopCpuHosts(cpuIdleResult, 3);
+    const topMemoryHosts = monitoringGetTopMemoryHosts(memoryUsableResult, 3);
+    const topLatencyResources = monitoringGetTopLatencyResources(
+      latencyResult,
+      3
+    );
+
+function monitoringGetUserFromScope(scope = "") {
+  const match =
+    String(scope).match(/usr\.name:([^,\s]+)/) ||
+    String(scope).match(/usr_name:([^,\s]+)/) ||
+    String(scope).match(/user\.name:([^,\s]+)/) ||
+    String(scope).match(/name:([^,\s]+)/);
+
+  return match?.[1] || "unknown";
+}
+
+function monitoringFormatSessions(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+
+  const count = Math.round(Number(value));
+  return count === 1 ? "1 session" : `${count} sessions`;
+}
+
+function monitoringGetTopVisitorUsers(result, limit = 3) {
+  return (result.series || [])
+    .map((item) => {
+      const total = monitoringTotal(
+        monitoringGetSeriesValues(item.pointlist || [])
+      );
+
+      return {
+        username: monitoringGetUserFromScope(item.scope),
+        value: total,
+        displayValue: monitoringFormatSessions(total),
+      };
+    })
+    .filter((item) => item.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
+const topVisitorUsers = monitoringGetTopVisitorUsers(visitorsResult, 3);
+
+const visitorsTotal = monitoringTotal(
+  monitoringGetAllValues(visitorsResult)
+);
+
+    return res.json({
+      range: {
+        timezone: "Asia/Seoul",
+        from: fromSec,
+        to: toSec,
+      },
+      metrics: {
+        cpu: topCpuHosts[0]?.displayValue || "-",
+        memory: topMemoryHosts[0]?.displayValue || "-",
+        latency: topLatencyResources[0]?.displayValue || "-",
+        visitors: `${Math.round(visitorsTotal)} sessions`,
+      },
+details: {
+  cpuHosts: topCpuHosts,
+  memoryHosts: topMemoryHosts,
+  latencyResources: topLatencyResources,
+  visitorsUsers: topVisitorUsers,
+},
+    });
+
+    
+  } catch (error) {
+    console.error("monitoring_summary_failed:", error);
+
+    return res.status(500).json({
+      error: error?.message || "failed to load monitoring summary",
+    });
+  }
 });
 
 /**
@@ -1008,12 +1410,22 @@ app.post("/chat", authRequired, async (req, res) => {
                 content: `
 You are a helpful assistant for a Datadog demo application.
 
+Current OpenAI model:
+${OPENAI_MODEL}
+
 IMPORTANT RULES:
-- If the user asks about current time, you MUST use the get_current_time tool.
-- Do NOT generate time yourself.
-- Always prefer using tools when available.
+
+- If the user asks about current time, use get_current_time.
+- If the user asks about Datadog incidents, outages, failures, alerts, monitors, logs, traces, metrics, infrastructure or observability, use query_datadog.
+- Do not invent Datadog data.
+- Always use tools when Datadog information is requested.
 - Use retrieved context if provided.
-                `.trim(),
+
+MODEL RULES:
+- If the user asks which model is running, answer exactly with the model name shown above.
+- Never say GPT-4 unless the model name above is GPT-4.
+- Never guess the model name.
+`.trim(),
               },
               ...recentHistory.map((msg) => ({
                 role: msg.role,
@@ -1125,11 +1537,27 @@ IMPORTANT RULES:
 
                 let toolResult;
 
-                if (toolName === "get_current_time") {
-                  toolResult = getCurrentTimeTool();
-                } else {
-                  toolResult = { error: `Unknown tool: ${toolName}` };
-                }
+if (toolName === "get_current_time") {
+
+  toolResult =
+    getCurrentTimeTool();
+
+} else if (
+  toolName === "query_datadog"
+) {
+
+  toolResult =
+    await queryDatadogTool(
+      parsedArgs.query
+    );
+
+} else {
+
+  toolResult = {
+    error: `Unknown tool: ${toolName}`,
+  };
+
+}
 
                 logger.info("chat_tool_executed", {
                   user_id: userId,
@@ -1275,17 +1703,16 @@ IMPORTANT RULES:
       retrievalCount: result.retrievedChunks.length,
     };
 
-    const responseBody = {
-      conversationId: conversation.id,
-      message: {
-        id: result.assistantMessage?.id ?? `assistant-${Date.now()}`,
-        role: "assistant",
-        content: result.answer,
-        created_at:
-          result.assistantMessage?.created_at ?? new Date().toISOString(),
-      },
-      trace,
-    };
+const responseBody = {
+  conversationId: conversation.id,
+  message: {
+    id: result.assistantMessage?.id ?? `assistant-${Date.now()}`,
+    role: "assistant",
+    content: result.answer,
+    created_at: new Date().toISOString(),
+  },
+  trace,
+};
 
     logger.info("chat_request_success", {
       user_id: userId,
