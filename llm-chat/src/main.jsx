@@ -4,6 +4,7 @@ import "./index.css";
 import App from "./App.jsx";
 import ErrorBoundary from "./ErrorBoundary.jsx";
 
+import { BrowserRouter } from "react-router-dom";
 import { datadogRum } from "@datadog/browser-rum";
 import { reactPlugin } from "@datadog/browser-rum-react";
 import { datadogLogs } from "@datadog/browser-logs";
@@ -14,7 +15,7 @@ datadogRum.init({
   site: "datadoghq.com",
   service: "shlim-toy-chat-front",
   env: "dev",
-  version: "0.0.2",
+  version: "0.1.1",
   sessionSampleRate: 100,
   sessionReplaySampleRate: 100,
   defaultPrivacyLevel: "mask-user-input",
@@ -23,6 +24,14 @@ datadogRum.init({
       match: /\/(auth|chat|conversations|health)(\/|$)/,
       propagatorTypes: ["tracecontext", "datadog"],
     },
+    {
+      match: /https:\/\/6kw29887b6\.execute-api\.us-east-1\.amazonaws\.com/,
+      propagatorTypes: ["tracecontext", "datadog"],
+    },
+    {
+      match: /https:\/\/zxezp1ixj5\.execute-api\.us-east-1\.amazonaws\.com/,
+      propagatorTypes: ["tracecontext", "datadog"],
+},
   ],
   plugins: [reactPlugin()],
   beforeSend: (event) => {
@@ -53,8 +62,10 @@ datadogRum.startSessionReplayRecording();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
+    <BrowserRouter>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </BrowserRouter>
   </React.StrictMode>
 );
