@@ -1,7 +1,7 @@
 {
   "version": 1,
   "embeddingModel": "text-embedding-3-small",
-  "updatedAt": "2026-06-17T00:14:24.277Z",
+  "updatedAt": "2026-06-17T06:49:34.137Z",
   "chunks": {
     "a19e18b866b2f6a5a3531235dafc81bbf4ccdda7f8a50aced1d134ddc6bdc20b": {
       "id": "datadog-apm.txt::chunk_1",

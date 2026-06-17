@@ -4,18 +4,26 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
-    "dev": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs"
+    "dev": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs",
+"test": "node --env-file=.env ./node_modules/mocha/bin/mocha.js \"tests/**/*.test.js\"",
+"test:dd": "node --env-file=.env -r dd-trace/ci/init ./node_modules/mocha/bin/mocha.js \"tests/**/*.test.js\""
   },
   "dependencies": {
     "@datadog/datadog-api-client": "^1.58.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
-    "dd-trace": "^5.92.0",
+    "dd-trace": "^5.109.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.20.0",
     "openai": "^6.32.0",
     "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "@vitest/ui": "^4.1.9",
+    "cross-env": "^7.0.3",
+    "mocha": "^11.7.6",
+    "vitest": "^4.1.9"
   }
 }

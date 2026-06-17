@@ -15,7 +15,7 @@ datadogRum.init({
   site: "datadoghq.com",
   service: "shlim-toy-chat-front",
   env: "dev",
-  version: "0.1.1",
+  version: "0.2.0",
   sessionSampleRate: 100,
   sessionReplaySampleRate: 100,
   defaultPrivacyLevel: "mask-user-input",
