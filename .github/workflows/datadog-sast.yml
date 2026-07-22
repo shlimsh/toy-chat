@@ -6,6 +6,9 @@ on:
       - main
       - haha
 
+permissions:
+  contents: read
+
 jobs:
   check-quality:
     runs-on: ubuntu-latest
