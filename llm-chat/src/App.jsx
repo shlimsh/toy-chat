@@ -874,9 +874,14 @@ const restored = (data.messages || [])
 
 setMessages(restored.length > 0 ? restored : initialMessages);
 
+const latestUserIndex = restored.reduce(
+  (latest, msg, index) => (msg.role === "user" ? index : latest),
+  -1
+);
+
 const latestAssistantTraces = restored
+  .slice(latestUserIndex + 1)
   .filter((msg) => msg.role === "assistant" && msg.trace)
-  .slice(-2)
   .map((msg) => msg.trace);
 
 if (latestAssistantTraces.length > 0) {
@@ -1226,6 +1231,7 @@ const assistantMessages = Array.isArray(data?.responses)
         provider: item.provider,
         model: item.model,
         content: item.content || "응답이 비어 있습니다.",
+        trace: item.trace || null,
         rawCreatedAt: createdAt,
         timestamp: buildTimestampLabel(createdAt),
       };
@@ -1237,6 +1243,7 @@ const assistantMessages = Array.isArray(data?.responses)
         provider: data?.message?.provider || "OpenAI",
         model: data?.message?.model || data?.trace?.model,
         content: data?.message?.content ?? "응답이 비어 있습니다.",
+        trace: data?.message?.trace || null,
         rawCreatedAt: data?.message?.created_at || new Date().toISOString(),
         timestamp: buildTimestampLabel(
           data?.message?.created_at || new Date().toISOString()

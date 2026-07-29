@@ -28,15 +28,8 @@ import {
   saveEmbeddingCache,
   cosineSimilarity,
 } from "./rag.mjs";
-
-
-
-console.log("DD_GIT_REPOSITORY_URL =", process.env.DD_GIT_REPOSITORY_URL);
-console.log("DD_GIT_COMMIT_SHA =", process.env.DD_GIT_COMMIT_SHA);
-console.log("DD_SERVICE =", process.env.DD_SERVICE);
-console.log("DD_VERSION =", process.env.DD_VERSION);
-console.log("DD_ENV =", process.env.DD_ENV);
-console.log("DD_TAGS =", process.env.DD_TAGS);
+import { serializeTelemetry } from "./telemetry-sanitizer.mjs";
+import { buildProviderHistory } from "./conversation-history.mjs";
 
 const app = express();
 const llmobs = tracer.llmobs;
@@ -149,16 +142,6 @@ function safeJsonParse(value, fallback = {}) {
   }
 }
 
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (error) {
-    return JSON.stringify({
-      stringify_error: error.message,
-    });
-  }
-}
-
 const SPAN_BODY_TAG_MAX = Number(process.env.SPAN_BODY_TAG_MAX || 8192);
 
 function truncateForSpan(str) {
@@ -171,12 +154,18 @@ function truncateForSpan(str) {
 
 function setRequestBodyOnSpan(span, body) {
   if (!span) return;
-  span.setTag("http.request.body", truncateForSpan(safeStringify(body)));
+  span.setTag(
+    "http.request.body",
+    truncateForSpan(serializeTelemetry(body, { maxStringLength: SPAN_BODY_TAG_MAX }))
+  );
 }
 
 function setResponseBodyOnSpan(span, body) {
   if (!span) return;
-  span.setTag("http.response.body", truncateForSpan(safeStringify(body)));
+  span.setTag(
+    "http.response.body",
+    truncateForSpan(serializeTelemetry(body, { maxStringLength: SPAN_BODY_TAG_MAX }))
+  );
 }
 
 function markSpanError(error, extraTags = {}) {
@@ -818,35 +807,33 @@ async function runAzureFoundryModel({
     }),
   });
 
-const text = await response.text();
+  const text = await response.text();
+  let data = null;
 
-console.log("===== Azure Response =====");
-console.log(text);
-console.log("ENDPOINT =", process.env.AZURE_OPENAI_ENDPOINT);
-console.log("MODEL =", process.env.AZURE_OPENAI_MODEL);
-console.log("KEY =", process.env.AZURE_OPENAI_API_KEY.substring(0, 10));
-let data = null;
-
-try {
+  try {
     data = text ? JSON.parse(text) : null;
-} catch {
+  } catch {
     data = { raw: text };
-}
+  }
 
-if (!response.ok){
-logApiError({
-    req:null,
-    event:"azure_request_failed",
-    error:new Error(`Azure HTTP ${response.status}`),
-    recoverable:true,
-    metadata:{
-        endpoint,
+  if (!response.ok) {
+    const error = new Error(`Azure HTTP ${response.status}`);
+
+    logApiError({
+      req: null,
+      event: "azure_request_failed",
+      error,
+      recoverable: true,
+      metadata: {
         model,
-        status_code:response.status,
-        response:data
-    }
-});
-}
+        status_code: response.status,
+        azure_error_code: data?.error?.code,
+        azure_error_message: data?.error?.message,
+      },
+    });
+
+    throw error;
+  }
 
   const content =
     data?.choices?.[0]?.message?.content ||
@@ -1714,18 +1701,6 @@ logApiInfo({
 
             const history = await getMessagesByConversationId(conversation.id);
 
-            const recentHistory = history
-              .filter((msg) => msg.role === "user" || msg.role === "assistant")
-              .slice(-8);
-
-            const baseMessages = recentHistory.map((msg) => ({
-              role: msg.role,
-              content:
-                msg.role === "assistant" && msg.metadata?.provider
-                  ? `[${msg.metadata.provider} / ${msg.metadata.model || "unknown"}]\n${msg.content}`
-                  : msg.content,
-            }));
-
             const intent = classifyUserIntent(String(message));
 
             logger.info("chat_intent_classified", {
@@ -1779,7 +1754,7 @@ const modelJobs = [
         provider: "OpenAI",
         client: openaiClient,
         model: OPENAI_MODEL,
-        baseMessages,
+        baseMessages: buildProviderHistory(history, "OpenAI"),
         docsContext,
         conversationId: conversation.id,
         userId,
@@ -1791,7 +1766,7 @@ const modelJobs = [
       runAzureFoundryModel({
         provider: "Azure AI",
         model: AZURE_OPENAI_MODEL,
-        baseMessages,
+        baseMessages: buildProviderHistory(history, "Azure AI"),
         docsContext,
       }),
   },
@@ -1799,15 +1774,6 @@ const modelJobs = [
 
 const settled = await Promise.allSettled(
   modelJobs.map((job) => job.runner())
-);
-console.log("===== SETTLED RESULT =====");
-console.log(
-  settled.map((item, index) => ({
-    index,
-    provider: modelJobs[index]?.provider,
-    status: item.status,
-    reason: item.status === "rejected" ? item.reason?.message : undefined,
-  }))
 );
 
             const responses = [];
@@ -1818,6 +1784,17 @@ console.log(
 
               if (item.status === "fulfilled") {
                 const value = item.value;
+                const responseTrace = {
+                  provider: value.provider,
+                  model: value.model,
+                  totalLatencyMs: value.latencyMs,
+                  totalTokens: value.totalTokens,
+                  costEstimate: value.costEstimate,
+                  promptTokens: value.promptTokens,
+                  completionTokens: value.completionTokens,
+                  usedTools: value.usedTools,
+                  retrievalCount: retrievedChunks.length,
+                };
 
                 const assistantMessage = await createMessage({
                   conversationId: conversation.id,
@@ -1836,6 +1813,8 @@ console.log(
                     retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
                     retrieval_count: retrievedChunks.length,
                     user_id: userId,
+                    request_id: req.requestId,
+                    trace: responseTrace,
                   },
                 });
 
@@ -1847,17 +1826,7 @@ console.log(
                   content: value.content,
                   created_at:
                     assistantMessage?.created_at || new Date().toISOString(),
-                  trace: {
-                    provider: value.provider,
-                    model: value.model,
-                    totalLatencyMs: value.latencyMs,
-                    totalTokens: value.totalTokens,
-                    costEstimate: value.costEstimate,
-                    promptTokens: value.promptTokens,
-                    completionTokens: value.completionTokens,
-                    usedTools: value.usedTools,
-                    retrievalCount: retrievedChunks.length,
-                  },
+                  trace: responseTrace,
                 });
 
 logLlmCompleted({
@@ -1877,6 +1846,15 @@ logLlmCompleted({
               } else {
                 const errorMessage =
                   item.reason?.message || `${job.provider} request failed`;
+                const failedModel =
+                  job.provider === "Azure AI"
+                    ? AZURE_OPENAI_MODEL
+                    : OPENAI_MODEL;
+                const responseTrace = {
+                  provider: job.provider,
+                  model: failedModel,
+                  error: errorMessage,
+                };
 
                 const assistantMessage = await createMessage({
                   conversationId: conversation.id,
@@ -1884,9 +1862,11 @@ logLlmCompleted({
                   content: `에러 발생: ${errorMessage}`,
                   metadata: {
                     provider: job.provider,
-                    model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+                    model: failedModel,
                     error: errorMessage,
                     user_id: userId,
+                    request_id: req.requestId,
+                    trace: responseTrace,
                   },
                 });
 
@@ -1894,15 +1874,11 @@ logLlmCompleted({
                   id: assistantMessage?.id ?? `assistant-error-${Date.now()}`,
                   role: "assistant",
                   provider: job.provider,
-                  model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+                  model: failedModel,
                   content: `에러 발생: ${errorMessage}`,
                   created_at:
                     assistantMessage?.created_at || new Date().toISOString(),
-                  trace: {
-                    provider: job.provider,
-                    model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
-                    error: errorMessage,
-                  },
+                  trace: responseTrace,
                 });
 
 logLlmFailed({
@@ -1910,7 +1886,7 @@ logLlmFailed({
   conversationId: conversation.id,
   requestId: req.requestId,
   provider: job.provider,
-  model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+  model: failedModel,
   stage: "chat_model_compare",
   error: item.reason,
 });

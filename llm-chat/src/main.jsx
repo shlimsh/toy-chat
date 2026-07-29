@@ -34,10 +34,6 @@ datadogRum.init({
 },
   ],
   plugins: [reactPlugin()],
-  beforeSend: (event) => {
-    console.log("RUM event:", event.type, event);
-    return true;
-  },
 });
 
 datadogLogs.init({
@@ -45,18 +41,13 @@ datadogLogs.init({
   site: "datadoghq.com",
   service: "shlim-toy-chat-front",
   env: "dev",
-  version: "0.0.2",
+  version: "0.2.0",
   forwardErrorsToLogs: true,
   sessionSampleRate: 100,
-  forwardConsoleLogs: ["debug", "log", "info", "warn", "error"],
+  forwardConsoleLogs: ["warn", "error"],
 });
 
 window.DD_RUM = datadogRum;
-
-setTimeout(() => {
-  datadogRum.addAction("rum_test_event");
-  console.log("DD context:", datadogRum.getInternalContext());
-}, 3000);
 
 datadogRum.startSessionReplayRecording();
 

@@ -51,9 +51,6 @@ export function verifyToken(token) {
 }
 
 export function authRequired(req, res, next) {
-  console.log("===== AUTH HEADER =====");
-  console.log(req.headers.authorization);
-
   const authHeader = req.headers.authorization || "";
 
   const token = authHeader.startsWith("Bearer ")
@@ -68,13 +65,10 @@ export function authRequired(req, res, next) {
     const decoded = verifyToken(token);
     req.user = decoded;
     return next();
-  } catch (error) {
-    console.error("===== JWT ERROR =====");
-    console.error(error);
-
+  } catch {
     return res.status(401).json({
-      error: "invalid token",
-      reason: error.message,
+      error: "invalid_token",
+      message: "인증 정보가 만료되었거나 유효하지 않습니다.",
     });
   }
 }
