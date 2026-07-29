@@ -97,9 +97,9 @@ const toSafeDate = (value) => {
       return new Date(trimmed);
     }
 
-    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
-      return new Date(trimmed.replace(" ", "T") + "Z");
-    }
+if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+  return new Date(trimmed.replace(" ", "T") + "Z");
+}
 
     return new Date(trimmed);
   }
@@ -179,10 +179,21 @@ const makeLocalTimestamp = () => {
 
 const initialMessages = [
   {
-    id: "welcome",
+    id: "welcome-openai",
     role: "assistant",
+    provider: "OpenAI",
+    model: "gpt-5-mini",
     content:
       "안녕하세요. 로그인 기반 Datadog 데모 채팅입니다. 질문을 입력하면 채팅과 함께 trace 정보가 오른쪽 패널에 표시됩니다.",
+    ...makeLocalTimestamp(),
+  },
+  {
+    id: "welcome-azure",
+    role: "assistant",
+    provider: "Azure AI",
+    model: "grok-4.3",
+    content:
+      "Azure AI도 함께 준비되어 있습니다. 질문을 보내면 OpenAI와 Azure AI 응답을 나란히 비교할 수 있습니다.",
     ...makeLocalTimestamp(),
   },
 ];
@@ -256,7 +267,7 @@ function Modal({
 }
 
 function TracePanel({
-  stats,
+  currentTrace,
   conversations,
   conversationId,
   onSelectConversation,
@@ -267,10 +278,56 @@ function TracePanel({
   weatherMain,
   forecastItems,
 }) {
-  const hasAiMetrics = stats.some((item) => !["-", "$-"].includes(item.value));
-  const aiSummaryText = hasAiMetrics
-    ? "최근 AI 응답의 모델, 지연 시간, 토큰 사용량, 예상 비용을 요약했습니다."
-    : "질문을 보내면 AI 응답 지표가 자동으로 업데이트됩니다.";
+const providerTraces = Array.isArray(currentTrace?.models)
+  ? currentTrace.models
+  : [];
+
+const runtimeItems =
+  providerTraces.length > 0
+    ? providerTraces.map((item) => ({
+        provider: item.provider || "-",
+        model: item.model || "-",
+        latency:
+          item.totalLatencyMs !== undefined ? `${item.totalLatencyMs} ms` : "-",
+        tokens: item.totalTokens !== undefined ? `${item.totalTokens}` : "-",
+        cost:
+          item.costEstimate !== undefined ? `$${item.costEstimate}` : "$-",
+        error: item.error || null,
+        hasData: true,
+      }))
+    : [
+        {
+          provider: "OpenAI",
+          model: "gpt-5-mini-2025-08-07",
+          latency: "-",
+          tokens: "-",
+          cost: "$-",
+          error: null,
+          hasData: false,
+        },
+        {
+          provider: "Azure AI",
+          model: "grok-4.3",
+          latency: "-",
+          tokens: "-",
+          cost: "$-",
+          error: null,
+          hasData: false,
+        },
+      ];
+
+  const totalLatency =
+    currentTrace?.totalLatencyMs !== undefined
+      ? `${currentTrace.totalLatencyMs} ms`
+      : "-";
+
+  const totalTokens =
+    currentTrace?.totalTokens !== undefined ? `${currentTrace.totalTokens}` : "-";
+
+  const totalCost =
+    currentTrace?.costEstimate !== undefined
+      ? `$${currentTrace.costEstimate}`
+      : "$-";
 
   return (
     <div style={styles.sidePanel}>
@@ -281,12 +338,9 @@ function TracePanel({
           rel="noreferrer"
           style={styles.bannerCard}
         >
-          <div>
-
-            <div style={styles.bannerTitle}>🐶 Datadog 콘솔 바로가기</div>
-          </div>
-
+          <div style={styles.bannerTitle}>🐶 Datadog 콘솔 바로가기</div>
         </a>
+
         <div style={styles.weatherSummaryCard}>
           <div style={styles.infoLineItem}>
             <span style={styles.infoLineIcon}>🕒</span>
@@ -315,28 +369,72 @@ function TracePanel({
             ))}
           </div>
         </div>
-
       </div>
 
-      <div style={styles.aiInsightCard}>
-        <div style={styles.cardSectionTitle}>✨ AI 요약</div>
-
-        <div style={styles.aiSummaryBox}>
-          {aiSummaryText}
+      <div style={styles.runtimeCard}>
+        <div style={styles.runtimeHeader}>
+          <div>
+            <div style={styles.runtimeEyebrow}>LLM OBSERVABILITY</div>
+            <div style={styles.runtimeTitle}>AI Runtime</div>
+          </div>
+          <div style={styles.runtimeBadge}>Dual Model</div>
         </div>
 
-        <div style={styles.cardSectionTitleSmall}>📊 AI 응답 지표</div>
-
-        <div style={styles.metricListVertical}>
-          {stats.map((item) => (
-            <div key={item.label} style={styles.metricRow}>
-              <div style={styles.metricRowLabel}>
-                <span style={styles.metricIcon}>{item.icon}</span>
-                <strong>{item.label}</strong>
+        <div style={styles.runtimeProviderList}>
+          {runtimeItems.map((item) => (
+            <div key={item.provider} style={styles.runtimeProviderCard}>
+              <div style={styles.runtimeProviderHeader}>
+                <div style={styles.runtimeProviderName}>
+                  {item.provider === "Azure AI" ? "🧊" : "֎"} {item.provider}
+                </div>
+                <div 
+style={{
+  ...styles.runtimeStatus,
+  ...(item.error ? styles.runtimeStatusError : {}),
+  ...(!item.hasData && !item.error ? styles.runtimeStatusWaiting : {}),
+}}
+                >
+                  {item.error ? "Failed" : item.hasData ? "OK" : "Waiting"}
+                </div>
               </div>
-              <span style={styles.metricRowValue}>{item.value}</span>
+
+              <div style={styles.runtimeModel}>{item.model}</div>
+
+              <div style={styles.runtimeMiniGrid}>
+                <div style={styles.runtimeMiniItem}>
+                  <span>Latency</span>
+                  <strong>{item.latency}</strong>
+                </div>
+                <div style={styles.runtimeMiniItem}>
+                  <span>Tokens</span>
+                  <strong>{item.tokens}</strong>
+                </div>
+                <div style={styles.runtimeMiniItemFull}>
+                  <span>Cost</span>
+                  <strong>{item.cost}</strong>
+                </div>
+              </div>
+
+              {item.error ? (
+                <div style={styles.runtimeErrorText}>{item.error}</div>
+              ) : null}
             </div>
           ))}
+        </div>
+
+        <div style={styles.runtimeTotalBox}>
+          <div style={styles.runtimeTotalRow}>
+            <span>⚡ Total Latency</span>
+            <strong>{totalLatency}</strong>
+          </div>
+          <div style={styles.runtimeTotalRow}>
+            <span>🧮 Total Tokens</span>
+            <strong>{totalTokens}</strong>
+          </div>
+          <div style={styles.runtimeTotalRow}>
+            <span>💰 Estimated Cost</span>
+            <strong>{totalCost}</strong>
+          </div>
         </div>
       </div>
 
@@ -356,9 +454,7 @@ function TracePanel({
                 onClick={() => onSelectConversation(conv.id)}
                 style={{
                   ...styles.historyItem,
-                  ...(conversationId === conv.id
-                    ? styles.historyItemActive
-                    : {}),
+                  ...(conversationId === conv.id ? styles.historyItemActive : {}),
                 }}
               >
                 {conv.title}
@@ -607,6 +703,7 @@ export default function App() {
 
   const chatScrollRef = useRef(null);
   const inputRef = useRef(null);
+const skipNextConversationLoadRef = useRef(false);
 
   const clearSession = () => {
     localStorage.removeItem("authToken");
@@ -681,42 +778,6 @@ export default function App() {
     }),
     [token]
   );
-
-  const stats = useMemo(() => {
-    if (!currentTrace) {
-      return [
-        { label: "Model", value: "-", icon: "🤖" },
-        { label: "Latency", value: "-", icon: "⚡" },
-        { label: "Tokens", value: "-", icon: "🧮" },
-        { label: "Cost", value: "$-", icon: "💰" },
-      ];
-    }
-
-    return [
-      { label: "Model", value: currentTrace.model || "-", icon: "🤖" },
-      {
-        label: "Latency",
-        value:
-          currentTrace.totalLatencyMs !== undefined
-            ? `${currentTrace.totalLatencyMs} ms`
-            : "-",
-        icon: "⚡",
-      },
-      {
-        label: "Tokens",
-        value:
-          currentTrace.totalTokens !== undefined
-            ? `${currentTrace.totalTokens}`
-            : "-",
-        icon: "🧮",
-      },
-      {
-        label: "Cost",
-        value: `$${currentTrace.costEstimate || "-"}`,
-        icon: "💰",
-      },
-    ];
-  }, [currentTrace]);
 
   const openModal = (
     title,
@@ -798,39 +859,75 @@ export default function App() {
         throw new Error(data.error || "failed to load messages");
       }
 
-      const restored = (data.messages || [])
-        .filter((msg) => msg.role === "user" || msg.role === "assistant")
-        .map((msg, index) => ({
-          id: msg.id || `${msg.role}-${index}`,
-          role: msg.role,
-          content: msg.content,
-          rawCreatedAt: msg.created_at,
-          timestamp: buildTimestampLabel(msg.created_at),
-        }));
+const restored = (data.messages || [])
+  .filter((msg) => msg.role === "user" || msg.role === "assistant")
+  .map((msg, index) => ({
+    id: msg.id || `${msg.role}-${index}`,
+    role: msg.role,
+    content: msg.content,
+    provider: msg.provider || msg.metadata?.provider || null,
+    model: msg.model || msg.metadata?.model || null,
+    trace: msg.trace || msg.metadata?.trace || null,
+    rawCreatedAt: msg.created_at,
+    timestamp: buildTimestampLabel(msg.created_at),
+  }));
 
-      setMessages(restored.length > 0 ? restored : initialMessages);
-      requestAnimationFrame(scrollToBottom);
+setMessages(restored.length > 0 ? restored : initialMessages);
+
+const latestAssistantTraces = restored
+  .filter((msg) => msg.role === "assistant" && msg.trace)
+  .slice(-2)
+  .map((msg) => msg.trace);
+
+if (latestAssistantTraces.length > 0) {
+  setCurrentTrace({
+    model: latestAssistantTraces
+      .map((item) => `${item.provider}: ${item.model}`)
+      .join(" / "),
+    models: latestAssistantTraces,
+    totalLatencyMs: Math.max(
+      ...latestAssistantTraces.map((item) => Number(item.totalLatencyMs || 0))
+    ),
+    totalTokens: latestAssistantTraces.reduce(
+      (sum, item) => sum + Number(item.totalTokens || 0),
+      0
+    ),
+    costEstimate: latestAssistantTraces
+      .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
+      .toFixed(6),
+  });
+} else {
+  setCurrentTrace(null);
+}
+
+requestAnimationFrame(scrollToBottom);
     } catch (error) {
       console.error(error);
     }
   };
 
-  useEffect(() => {
-    if (token) {
-      loadConversations();
-    }
-  }, [token]);
+useEffect(() => {
+  if (!authChecking && token && user) {
+    loadConversations();
+  }
+}, [authChecking, token, user]);
 
   useEffect(() => {
-    if (conversationId) {
-      localStorage.setItem("conversationId", conversationId);
-      loadMessages(conversationId);
-    } else {
-      localStorage.removeItem("conversationId");
-      setMessages(initialMessages);
-      setCurrentTrace(null);
+  if (conversationId) {
+    localStorage.setItem("conversationId", conversationId);
+
+    if (skipNextConversationLoadRef.current) {
+      skipNextConversationLoadRef.current = false;
+      return;
     }
-  }, [conversationId]);
+
+    loadMessages(conversationId);
+  } else {
+    localStorage.removeItem("conversationId");
+    setMessages(initialMessages);
+    setCurrentTrace(null);
+  }
+}, [conversationId]);
 
   useEffect(() => {
     requestAnimationFrame(scrollToBottom);
@@ -1111,26 +1208,46 @@ const daily = (forecast.list || [])
         throw new Error(data?.error || `HTTP ${response.status}`);
       }
 
-      if (data?.conversationId) {
-        setConversationId(data.conversationId);
-      }
+if (data?.conversationId) {
+  if (!conversationId || data.conversationId !== conversationId) {
+    skipNextConversationLoadRef.current = true;
+  }
 
-      const assistantRawCreatedAt =
-        data?.message?.created_at || new Date().toISOString();
+  setConversationId(data.conversationId);
+}
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: data?.message?.id ?? `assistant-${Date.now()}`,
-          role: "assistant",
-          content: data?.message?.content ?? "응답이 비어 있습니다.",
-          rawCreatedAt: assistantRawCreatedAt,
-          timestamp: buildTimestampLabel(assistantRawCreatedAt),
-        },
-      ]);
+const assistantMessages = Array.isArray(data?.responses)
+  ? data.responses.map((item, index) => {
+      const createdAt = item.created_at || new Date().toISOString();
 
-      setCurrentTrace(data.trace || null);
-      loadConversations();
+      return {
+        id: item.id || `assistant-${Date.now()}-${index}`,
+        role: "assistant",
+        provider: item.provider,
+        model: item.model,
+        content: item.content || "응답이 비어 있습니다.",
+        rawCreatedAt: createdAt,
+        timestamp: buildTimestampLabel(createdAt),
+      };
+    })
+  : [
+      {
+        id: data?.message?.id ?? `assistant-${Date.now()}`,
+        role: "assistant",
+        provider: data?.message?.provider || "OpenAI",
+        model: data?.message?.model || data?.trace?.model,
+        content: data?.message?.content ?? "응답이 비어 있습니다.",
+        rawCreatedAt: data?.message?.created_at || new Date().toISOString(),
+        timestamp: buildTimestampLabel(
+          data?.message?.created_at || new Date().toISOString()
+        ),
+      },
+    ];
+
+setMessages((prev) => [...prev, ...assistantMessages]);
+
+setCurrentTrace(data.trace || null);
+loadConversations();
     } catch (error) {
       const localTime = makeLocalTimestamp();
 
@@ -1221,14 +1338,16 @@ const daily = (forecast.list || [])
 
 <div style={styles.userInfo}>
   <div>
-    <strong>사용자명: </strong> {user.name}
-  </div>
-  <div>
-    <strong>사용자 이메일: </strong> {user.email}
-  </div>
-</div>
+    <strong>사용자명: </strong>
+    <span data-dd-privacy="mask">{user.name}</span>
   </div>
 
+  <div>
+    <strong>사용자 이메일: </strong>
+    <span data-dd-privacy="mask">{user.email}</span>
+  </div>
+</div>
+</div>
   <div style={styles.headerActions}>
 <PageButton
   label={
@@ -1347,7 +1466,7 @@ const daily = (forecast.list || [])
           </div>
 
 <TracePanel
-  stats={stats}
+  currentTrace={currentTrace}
   conversations={conversations}
   conversationId={conversationId}
   onSelectConversation={setConversationId}
@@ -2065,16 +2184,91 @@ cardSectionTitleSmall: {
   alignItems: "center",
   gap: 8,
 },
+aiSummaryHeader: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 10,
+  marginBottom: 12,
+},
+
+aiSummaryEyebrow: {
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.08em",
+  color: "#7c3aed",
+  marginBottom: 3,
+},
+
+aiSummaryTitle: {
+  fontSize: 15,
+  fontWeight: 900,
+  color: COLORS.text,
+},
+
+aiSummaryBadge: {
+  borderRadius: 999,
+  padding: "5px 9px",
+  background: "#eef2ff",
+  color: "#4f46e5",
+  fontSize: 10,
+  fontWeight: 900,
+  border: "1px solid #c7d2fe",
+},
+
 aiSummaryBox: {
-  borderRadius: 12,
-  background: COLORS.card,
-  border: `1px solid ${COLORS.border}`,
-    boxShadow: ITEM_SHADOW,
-  padding: "10px 12px",
-  color: "#475569",
-  fontSize: 12,
-  fontWeight: 700,
-  lineHeight: 1.55,
+  borderRadius: 16,
+  background:
+    "linear-gradient(180deg, #f8faff 0%, #ffffff 100%)",
+  border: "1px solid #dbeafe",
+  boxShadow: "0 10px 22px rgba(37,99,235,0.08)",
+  padding: 12,
+  color: "#334155",
+},
+
+aiSummaryMainText: {
+  fontSize: 13,
+  fontWeight: 800,
+  lineHeight: 1.65,
+  color: "#1e293b",
+  marginBottom: 12,
+},
+
+aiSummaryGrid: {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 8,
+},
+
+aiSummaryMiniCard: {
+  minHeight: 62,
+  borderRadius: 14,
+  border: "1px solid #e2e8f0",
+  background: "#ffffff",
+  boxShadow: ITEM_SHADOW,
+  padding: "9px 10px",
+  display: "grid",
+  gap: 3,
+},
+
+aiSummaryMiniIcon: {
+  fontSize: 15,
+  lineHeight: 1,
+},
+
+aiSummaryMiniLabel: {
+  fontSize: 10,
+  color: COLORS.muted,
+  fontWeight: 900,
+},
+
+aiSummaryMiniValue: {
+  fontSize: 11,
+  color: COLORS.text,
+  fontWeight: 900,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
 },
 forecastListVertical: {
   display: "grid",
@@ -2124,6 +2318,167 @@ forecastDescInline: {
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
+},
+runtimeCard: {
+  width: "100%",
+  border: "1px solid #dbeafe",
+  background: "linear-gradient(180deg, #f8fbff 0%, #ffffff 100%)",
+  borderRadius: 18,
+  padding: 14,
+  boxShadow: "0 12px 26px rgba(37,99,235,0.08)",
+  flexShrink: 0,
+},
+runtimeStatusWaiting: {
+  color: "#64748b",
+  background: "#f8fafc",
+  border: "1px solid #e2e8f0",
+},
+runtimeHeader: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 10,
+  marginBottom: 12,
+},
+
+runtimeEyebrow: {
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.1em",
+  color: "#2563eb",
+  marginBottom: 4,
+},
+
+runtimeTitle: {
+  fontSize: 16,
+  fontWeight: 900,
+  color: COLORS.text,
+},
+
+runtimeBadge: {
+  borderRadius: 999,
+  padding: "5px 9px",
+  background: "#eff6ff",
+  color: "#1d4ed8",
+  fontSize: 10,
+  fontWeight: 900,
+  border: "1px solid #bfdbfe",
+},
+
+runtimeProviderList: {
+  display: "grid",
+  gap: 10,
+},
+
+runtimeProviderCard: {
+  borderRadius: 16,
+  border: "1px solid #e2e8f0",
+  background: "#ffffff",
+  padding: 12,
+  boxShadow: ITEM_SHADOW,
+},
+
+runtimeProviderHeader: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  marginBottom: 7,
+},
+
+runtimeProviderName: {
+  fontSize: 13,
+  fontWeight: 900,
+  color: COLORS.text,
+},
+
+runtimeStatus: {
+  fontSize: 10,
+  fontWeight: 900,
+  color: "#15803d",
+  background: "#dcfce7",
+  border: "1px solid #bbf7d0",
+  borderRadius: 999,
+  padding: "4px 7px",
+},
+
+runtimeStatusError: {
+  color: "#be123c",
+  background: "#fff1f2",
+  border: "1px solid #fecdd3",
+},
+
+runtimeModel: {
+  fontSize: 12,
+  fontWeight: 800,
+  color: COLORS.muted,
+  marginBottom: 10,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+},
+
+runtimeMiniGrid: {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 7,
+},
+
+runtimeMiniItem: {
+  borderRadius: 12,
+  background: "#f8fafc",
+  border: "1px solid #e2e8f0",
+  padding: "8px 9px",
+  display: "grid",
+  gap: 4,
+  fontSize: 11,
+  color: COLORS.muted,
+  fontWeight: 800,
+},
+
+runtimeMiniItemFull: {
+  gridColumn: "1 / -1",
+  borderRadius: 12,
+  background: "#f8fafc",
+  border: "1px solid #e2e8f0",
+  padding: "8px 9px",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  fontSize: 11,
+  color: COLORS.muted,
+  fontWeight: 800,
+},
+
+runtimeErrorText: {
+  marginTop: 8,
+  fontSize: 11,
+  color: "#be123c",
+  fontWeight: 700,
+  lineHeight: 1.5,
+},
+
+runtimeTotalBox: {
+  marginTop: 12,
+  borderTop: "1px dashed #cbd5e1",
+  paddingTop: 10,
+  display: "grid",
+  gap: 7,
+},
+
+runtimeTotalRow: {
+  minHeight: 34,
+  borderRadius: 12,
+  background: "#ffffff",
+  border: "1px solid #e2e8f0",
+  padding: "7px 10px",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 10,
+  fontSize: 12,
+  color: COLORS.softMuted,
+  fontWeight: 800,
 },
 headerTop: {
   display: "flex",

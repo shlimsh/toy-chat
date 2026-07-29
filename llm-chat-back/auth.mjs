@@ -51,7 +51,11 @@ export function verifyToken(token) {
 }
 
 export function authRequired(req, res, next) {
+  console.log("===== AUTH HEADER =====");
+  console.log(req.headers.authorization);
+
   const authHeader = req.headers.authorization || "";
+
   const token = authHeader.startsWith("Bearer ")
     ? authHeader.slice("Bearer ".length)
     : null;
@@ -64,7 +68,13 @@ export function authRequired(req, res, next) {
     const decoded = verifyToken(token);
     req.user = decoded;
     return next();
-  } catch {
-    return res.status(401).json({ error: "invalid token" });
+  } catch (error) {
+    console.error("===== JWT ERROR =====");
+    console.error(error);
+
+    return res.status(401).json({
+      error: "invalid token",
+      reason: error.message,
+    });
   }
 }

@@ -22,6 +22,9 @@ const poolConfig = {
   connectTimeout: 10000,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
+
+  timezone: "+09:00",
+  dateStrings: true,
 };
 
 if (DB_SSL_ENABLED) {

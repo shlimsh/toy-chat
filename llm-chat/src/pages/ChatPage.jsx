@@ -11,6 +11,9 @@ import {
   X,
 } from "lucide-react";
 
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
 function ErrorStateCard({ errorState, onRetry, onDismiss }) {
   if (!errorState) return null;
 
@@ -73,6 +76,137 @@ function ModeCard({ active, title, subtitle, icon, tone = "default", onClick }) 
   );
 }
 
+function groupMessages(messages = []) {
+  const groups = [];
+  let currentUser = null;
+  let assistants = [];
+  let orphanAssistants = [];
+
+  messages.forEach((msg) => {
+    if (msg.role === "user") {
+      if (orphanAssistants.length > 0) {
+        groups.push({
+          user: null,
+          assistants: orphanAssistants,
+        });
+        orphanAssistants = [];
+      }
+
+      if (currentUser) {
+        groups.push({
+          user: currentUser,
+          assistants,
+        });
+      }
+
+      currentUser = msg;
+      assistants = [];
+      return;
+    }
+
+    if (msg.role === "assistant") {
+      if (!currentUser) {
+        orphanAssistants.push(msg);
+        return;
+      }
+
+      assistants.push(msg);
+    }
+  });
+
+  if (orphanAssistants.length > 0) {
+    groups.push({
+      user: null,
+      assistants: orphanAssistants,
+    });
+  }
+
+  if (currentUser) {
+    groups.push({
+      user: currentUser,
+      assistants,
+    });
+  }
+
+  return groups;
+}
+
+function ModelAnswerCard({ message, answerIndex = 0 }) {
+  const fallbackProvider = answerIndex === 1 ? "Azure AI" : "OpenAI";
+  const fallbackModel = answerIndex === 1 ? "grok-4.3" : "gpt-5-mini";
+
+  const provider =
+    message.provider && message.provider !== "-" ? message.provider : fallbackProvider;
+
+  const model =
+    message.model && message.model !== "-" ? message.model : fallbackModel;
+
+  const isAzure = String(provider).toLowerCase().includes("azure");
+
+  return (
+    <div
+      style={{
+        ...styles.compareCard,
+        ...(isAzure ? styles.compareCardAzure : styles.compareCardOpenAI),
+      }}
+    >
+      <div style={styles.modelHeader}>
+        <div style={styles.modelHeaderLeft}>
+          <div
+            style={{
+              ...styles.modelIcon,
+              ...(isAzure ? styles.azureIcon : styles.openaiIcon),
+            }}
+          >
+            {isAzure ? "🧊" : "֎"}
+          </div>
+
+          <div style={styles.modelTitleWrap}>
+            <div style={styles.providerName}>{provider}</div>
+            <div style={styles.modelName}>{model}</div>
+          </div>
+        </div>
+
+        <span
+          style={{
+            ...styles.providerBadge,
+            ...(isAzure ? styles.providerBadgeAzure : styles.providerBadgeOpenAI),
+          }}
+        >
+          {isAzure ? "Azure" : "OpenAI"}
+        </span>
+      </div>
+
+      <div style={styles.answerScrollArea}>
+        <div style={styles.answerText}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              p: ({ children }) => <p style={styles.mdP}>{children}</p>,
+              ul: ({ children }) => <ul style={styles.mdUl}>{children}</ul>,
+              ol: ({ children }) => <ol style={styles.mdOl}>{children}</ol>,
+              li: ({ children }) => <li style={styles.mdLi}>{children}</li>,
+              strong: ({ children }) => (
+                <strong style={styles.mdStrong}>{children}</strong>
+              ),
+              h1: ({ children }) => <h1 style={styles.mdH1}>{children}</h1>,
+              h2: ({ children }) => <h2 style={styles.mdH2}>{children}</h2>,
+              h3: ({ children }) => <h3 style={styles.mdH3}>{children}</h3>,
+              code: ({ children }) => (
+                <code style={styles.mdCode}>{children}</code>
+              ),
+            }}
+          >
+            {message.content || ""}
+          </ReactMarkdown>
+        </div>
+      </div>
+
+      <div style={styles.answerTimestamp}>{message.timestamp}</div>
+    </div>
+  );
+}
+
 export default function ChatPage({
   TEST_MODES,
   selectedMode,
@@ -88,6 +222,8 @@ export default function ChatPage({
   chatScrollRef,
   inputRef,
 }) {
+  const groupedMessages = groupMessages(messages);
+
   return (
     <>
       <div style={styles.modeGrid}>
@@ -126,35 +262,48 @@ export default function ChatPage({
 
       <div style={styles.chatWrap}>
         <div ref={chatScrollRef} style={styles.chatBody}>
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              style={{
-                display: "flex",
-                justifyContent: msg.role === "user" ? "flex-end" : "flex-start",
-                marginBottom: 14,
-              }}
-            >
-              <div
-                style={{
-                  ...styles.bubble,
-                  ...(msg.role === "user"
-                    ? styles.userBubble
-                    : styles.assistantBubble),
-                }}
-              >
-                <div style={styles.bubbleMeta}>
-                  {msg.role === "user" ? <User size={13} /> : <Bot size={13} />}
-                  <span>{msg.timestamp}</span>
+          {groupedMessages.map((group, groupIndex) => (
+            <div key={`group-${groupIndex}`} style={styles.messageGroup}>
+              {group.user ? (
+                <div style={styles.userRow}>
+                  <div style={styles.userBubble}>
+                    <div style={styles.bubbleMeta}>
+                      <User size={13} />
+                      <span>{group.user.timestamp}</span>
+                    </div>
+                    <div style={styles.bubbleText}>{group.user.content}</div>
+                  </div>
                 </div>
-                <div style={styles.bubbleText}>{msg.content}</div>
-              </div>
+              ) : null}
+
+              {group.assistants.length > 0 ? (
+                <div
+                  style={{
+                    ...styles.compareGrid,
+                    gridTemplateColumns:
+                      group.assistants.length === 1
+                        ? "minmax(0, 1fr)"
+                        : "repeat(2, minmax(0, 1fr))",
+                  }}
+                >
+{group.assistants.map((msg, index) => (
+  <ModelAnswerCard
+    key={msg.id}
+    message={msg}
+    answerIndex={index}
+  />
+))}
+                </div>
+              ) : null}
             </div>
           ))}
 
           {loading ? (
-            <div style={{ display: "flex", justifyContent: "flex-start" }}>
-              <div style={styles.assistantBubble}>답변 생성 중...</div>
+            <div style={styles.loadingRow}>
+              <div style={styles.loadingCard}>
+                <Bot size={14} />
+                <span>OpenAI와 Azure AI 답변 생성 중...</span>
+              </div>
             </div>
           ) : null}
         </div>
@@ -277,11 +426,22 @@ const styles = {
     overflowY: "auto",
     paddingRight: 6,
   },
-  bubble: {
+  messageGroup: {
+    marginBottom: 22,
+  },
+  userRow: {
+    display: "flex",
+    justifyContent: "flex-end",
+    marginBottom: 12,
+  },
+  userBubble: {
     maxWidth: "76%",
     borderRadius: 22,
     padding: 14,
     lineHeight: 1.65,
+    background: "#0f172a",
+    color: "#fff",
+    boxShadow: "0 12px 28px rgba(15,23,42,0.16)",
   },
   bubbleMeta: {
     display: "flex",
@@ -296,17 +456,171 @@ const styles = {
     whiteSpace: "pre-wrap",
     letterSpacing: "-0.1px",
   },
-  userBubble: {
-    background: "#0f172a",
-    color: "#fff",
-    boxShadow: "0 12px 28px rgba(15,23,42,0.16)",
+compareGrid: {
+  display: "grid",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gap: 14,
+  alignItems: "stretch",
+},
+
+compareCard: {
+  border: "1px solid #e2e8f0",
+  borderRadius: 22,
+  background: "#fff",
+  padding: 16,
+  boxShadow: "0 10px 22px rgba(15,23,42,0.05)",
+  minWidth: 0,
+  height: 420,
+  display: "flex",
+  flexDirection: "column",
+  overflow: "hidden",
+},
+
+compareCardOpenAI: {
+  borderTop: "3px solid #6b7280",
+},
+
+compareCardAzure: {
+  borderTop: "3px solid #38bdf8",
+},
+
+modelTitleWrap: {
+  flex: 1,
+  minWidth: 0,
+  margin: 0,
+  padding: 0,
+  textAlign: "left",
+},
+
+providerBadge: {
+  width: 58,
+  height: 34,
+
+  flexShrink: 0,
+
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+
+  borderRadius: 999,
+
+  fontSize: 10,
+  fontWeight: 800,
+},
+
+providerBadgeOpenAI: {
+  color: "#374151",
+  background: "#f3f4f6",
+  borderColor: "#d1d5db",
+},
+
+providerBadgeAzure: {
+  color: "#0369a1",
+  background: "#f0f9ff",
+  borderColor: "#bae6fd",
+},
+
+answerScrollArea: {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  paddingRight: 6,
+  paddingLeft: 0,
+},
+modelHeader: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 12,
+  marginBottom: 12,
+  paddingBottom: 12,
+  borderBottom: "1px solid #edf2f7",
+},
+
+modelHeaderLeft: {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  flex: 1,
+  minWidth: 0,
+  textAlign: "left",
+},
+
+modelIcon: {
+  width: 36,
+  height: 36,
+  borderRadius: 12,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  flexShrink: 0,
+  border: "1px solid #e2e8f0",
+},
+openaiIcon: {
+  background: "#f3f4f6",
+  color: "#374151",
+},
+  azureIcon: {
+    background: "#f0f9ff",
   },
-  assistantBubble: {
+providerName: {
+  display: "block",
+  width: "100%",
+  fontSize: 14,
+  fontWeight: 900,
+  color: "#0f172a",
+  lineHeight: 1.2,
+  margin: 0,
+  padding: 0,
+  textAlign: "left",
+},
+modelName: {
+  display: "block",
+  width: "100%",
+  marginTop: 4,
+  fontSize: 12,
+  color: "#64748b",
+  fontWeight: 700,
+  lineHeight: 1.2,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+  textAlign: "left",
+},
+answerText: {
+  fontSize: 13,
+  color: "#0f172a",
+  lineHeight: 1.75,
+  letterSpacing: "-0.1px",
+  wordBreak: "keep-all",
+  textAlign: "left",
+},
+
+answerTimestamp: {
+  marginTop: 10,
+  paddingTop: 10,
+  borderTop: "1px solid #f1f5f9",
+  fontSize: 11,
+  color: "#94a3b8",
+  fontWeight: 700,
+  flexShrink: 0,
+},
+  loadingRow: {
+    display: "flex",
+    justifyContent: "flex-start",
+  },
+  loadingCard: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    borderRadius: 18,
+    padding: "12px 14px",
     background: "#fff",
-    color: "#0f172a",
+    color: "#475569",
     border: "1px solid #e2e8f0",
     boxShadow: "0 10px 22px rgba(15,23,42,0.05)",
     fontSize: 13,
+    fontWeight: 800,
   },
   errorWrap: {
     flexShrink: 0,
@@ -400,4 +714,60 @@ const styles = {
     cursor: "pointer",
     boxShadow: "0 12px 24px rgba(15,23,42,0.18)",
   },
+ mdH1: {
+  fontSize: 18,
+  fontWeight: 900,
+  margin: "0 0 12px",
+  color: "#0f172a",
+},
+
+mdH2: {
+  fontSize: 16,
+  fontWeight: 900,
+  margin: "0 0 10px",
+  color: "#0f172a",
+},
+
+mdH3: {
+  fontSize: 14,
+  fontWeight: 900,
+  margin: "10px 0 8px",
+  color: "#0f172a",
+},
+
+mdP: {
+  margin: "0 0 10px",
+  lineHeight: 1.75,
+},
+
+mdUl: {
+  margin: "6px 0 10px",
+  paddingLeft: 16,
+  listStylePosition: "outside",
+},
+
+mdOl: {
+  margin: "6px 0 10px",
+  paddingLeft: 16,
+  listStylePosition: "outside",
+},
+
+mdLi: {
+  marginBottom: 5,
+  lineHeight: 1.7,
+  paddingLeft: 0,
+},
+
+mdStrong: {
+  fontWeight: 900,
+  color: "#111827",
+},
+
+mdCode: {
+  background: "#f1f5f9",
+  padding: "2px 6px",
+  borderRadius: 6,
+  fontFamily: "Consolas, monospace",
+  fontSize: 12,
+},
 };

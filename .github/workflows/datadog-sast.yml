@@ -5,13 +5,16 @@ on:
     branches:
       - main
       - haha
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
   check-quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # GitHub가 어떤 OS에서 실행할지
     name: Datadog Static Analyzer
     steps:
       - name: Checkout
@@ -19,7 +22,7 @@ jobs:
 
       - name: Check code meets quality standards
         id: datadog-static-analysis
-        uses: DataDog/datadog-static-analyzer-github-action@v3
+        uses: DataDog/datadog-static-analyzer-github-action@v3 # GitHub Marketplace에 등록된 Datadog 공식 Action을 실행
         with:
           dd_app_key: ${{ secrets.DD_APP_KEY }}
           dd_api_key: ${{ secrets.DD_API_KEY }}

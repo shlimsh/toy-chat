@@ -5,7 +5,15 @@ import OpenAI from "openai";
 import crypto from "crypto";
 import tracer from "dd-trace";
 import * as datadogApiClient from "@datadog/datadog-api-client";
-import logger from "./logger.mjs";
+import logger, {
+  requestLogger,
+  logChatRequest,
+  logLlmCompleted,
+  logLlmFailed,
+  logApiError,
+  logApiWarn,
+  logApiInfo,
+} from "./logger.mjs";
 import { query, initDatabase } from "./db.mjs";
 import {
   hashPassword,
@@ -21,6 +29,8 @@ import {
   cosineSimilarity,
 } from "./rag.mjs";
 
+
+
 console.log("DD_GIT_REPOSITORY_URL =", process.env.DD_GIT_REPOSITORY_URL);
 console.log("DD_GIT_COMMIT_SHA =", process.env.DD_GIT_COMMIT_SHA);
 console.log("DD_SERVICE =", process.env.DD_SERVICE);
@@ -30,8 +40,32 @@ console.log("DD_TAGS =", process.env.DD_TAGS);
 
 const app = express();
 const llmobs = tracer.llmobs;
+
 const ML_APP =
   process.env.DD_LLMOBS_ML_APP || process.env.DD_SERVICE || "shlim-toy-chat";
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+const AZURE_OPENAI_MODEL = process.env.AZURE_OPENAI_MODEL || "gpt-4o-mini";
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
+
+const EMBEDDING_MODEL =
+  process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
+
+const RAG_CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE || 1000);
+const RAG_CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP || 150);
+const RAG_TOP_K = Number(process.env.RAG_TOP_K || 3);
+
+const openaiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const azureClient =
+  process.env.AZURE_OPENAI_API_KEY && AZURE_OPENAI_ENDPOINT
+    ? {
+        apiKey: process.env.AZURE_OPENAI_API_KEY,
+        endpoint: AZURE_OPENAI_ENDPOINT,
+      }
+    : null;
 
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
@@ -44,16 +78,11 @@ if (allowedOrigins.length > 0) {
       origin(origin, cb) {
         if (!origin) return cb(null, true);
 
-        if (
-          allowedOrigins.includes("*") ||
-          allowedOrigins.includes(origin)
-        ) {
+        if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
           return cb(null, true);
         }
 
-        return cb(
-          new Error(`Origin ${origin} not allowed by CORS`)
-        );
+        return cb(new Error(`Origin ${origin} not allowed by CORS`));
       },
       credentials: true,
     })
@@ -67,9 +96,7 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "1mb" }));
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+app.use(requestLogger);
 
 const ddConfig = datadogApiClient.client.createConfiguration({
   authMethods: {
@@ -82,27 +109,23 @@ ddConfig.setServerVariables({
   site: process.env.DD_SITE || "datadoghq.com",
 });
 
-const incidentsApi =
-  new datadogApiClient.v2.IncidentsApi(ddConfig);
+const incidentsApi = new datadogApiClient.v2.IncidentsApi(ddConfig);
+const metricsApi = new datadogApiClient.v1.MetricsApi(ddConfig);
 
-const metricsApi =
-  new datadogApiClient.v1.MetricsApi(ddConfig);
-
-const EMBEDDING_MODEL =
-  process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
-
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
-const RAG_CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE || 1000);
-const RAG_CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP || 150);
-const RAG_TOP_K = Number(process.env.RAG_TOP_K || 3);
-
-/**
- * 전역 예외 로그
- */
 process.on("uncaughtException", (error) => {
   logger.error("uncaught_exception", {
-    error_message: error.message,
-    error_stack: error.stack,
+    event: "uncaught_exception",
+    severity: "critical",
+    process: process.pid,
+    node_version: process.version,
+    uptime_sec: Math.floor(process.uptime()),
+    memory: process.memoryUsage(),
+    error: {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+    },
   });
 });
 
@@ -114,9 +137,6 @@ process.on("unhandledRejection", (reason) => {
   });
 });
 
-/**
- * 유틸
- */
 function generateId(prefix = "id") {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`.slice(0, 64);
 }
@@ -149,14 +169,6 @@ function truncateForSpan(str) {
   } chars]`;
 }
 
-function shouldUseTimeTool(message) {
-  return /현재 시간|지금 시간|몇 시|시각|time/i.test(String(message));
-}
-
-function shouldUseDocs(message) {
-  return String(message ?? "").trim().length > 0;
-}
-
 function setRequestBodyOnSpan(span, body) {
   if (!span) return;
   span.setTag("http.request.body", truncateForSpan(safeStringify(body)));
@@ -171,7 +183,7 @@ function markSpanError(error, extraTags = {}) {
   const span = tracer.scope().active();
   if (!span || !error) return;
 
-  span.setTag("error", error);
+  span.setTag("error", true);
   span.setTag("error.type", error.name || "Error");
   span.setTag("error.message", error.message || "unknown error");
   span.setTag("error.stack", error.stack || "");
@@ -183,9 +195,6 @@ function markSpanError(error, extraTags = {}) {
   }
 }
 
-/**
- * 공통 request/response body 추적 middleware
- */
 app.use((req, res, next) => {
   const span = tracer.scope().active();
 
@@ -210,8 +219,7 @@ app.use((req, res, next) => {
   res.send = function patchedSend(body) {
     const currentSpan = tracer.scope().active() || span;
     if (currentSpan) {
-      const parsed =
-        typeof body === "string" ? safeJsonParse(body, body) : body;
+      const parsed = typeof body === "string" ? safeJsonParse(body, body) : body;
       setResponseBodyOnSpan(currentSpan, parsed);
       currentSpan.setTag("http.status_code", res.statusCode);
     }
@@ -221,9 +229,6 @@ app.use((req, res, next) => {
   next();
 });
 
-/**
- * DB 헬퍼
- */
 async function getUserByEmail(email) {
   const rows = await query(
     `
@@ -234,6 +239,7 @@ async function getUserByEmail(email) {
     `,
     [email]
   );
+
   return rows[0] || null;
 }
 
@@ -247,6 +253,7 @@ async function getUserById(userId) {
     `,
     [userId]
   );
+
   return rows[0] || null;
 }
 
@@ -281,20 +288,6 @@ async function createConversation({ userId, title }) {
     LIMIT 1
     `,
     [id]
-  );
-
-  return rows[0] || null;
-}
-
-async function getConversationById(conversationId) {
-  const rows = await query(
-    `
-    SELECT id, user_id, title, created_at, updated_at
-    FROM conversations
-    WHERE id = ?
-    LIMIT 1
-    `,
-    [conversationId]
   );
 
   return rows[0] || null;
@@ -411,15 +404,12 @@ async function getConversationsByUserId(userId) {
   );
 }
 
-/**
- * RAG
- */
 const embedTextForIndexing = llmobs.wrap(
   { kind: "embedding", name: "embed_document_chunk" },
   async function embedTextForIndexing({ text, chunkId, docId }) {
     const safeText = String(text ?? "");
 
-    const response = await client.embeddings.create({
+    const response = await openaiClient.embeddings.create({
       model: EMBEDDING_MODEL,
       input: safeText,
     });
@@ -539,13 +529,19 @@ async function initRAG() {
   );
 }
 
-/**
- * LLMObs spans
- */
+function shouldUseTimeTool(message) {
+  return /현재 시간|지금 시간|몇 시|시각|time/i.test(String(message));
+}
+
+function shouldUseDocs(message) {
+  return String(message ?? "").trim().length > 0;
+}
+
 const classifyUserIntent = llmobs.wrap(
   { kind: "task", name: "classify_user_intent" },
   function classifyUserIntent(message) {
     const safeMessage = String(message ?? "");
+
     const result = {
       needTimeTool: shouldUseTimeTool(safeMessage),
       needDocs: shouldUseDocs(safeMessage),
@@ -584,16 +580,9 @@ const queryDatadogTool = llmobs.wrap(
   { kind: "tool", name: "query_datadog" },
   async function queryDatadogTool(queryText) {
     try {
-      const query = String(queryText || "").toLowerCase();
+      const q = String(queryText || "").toLowerCase();
 
-      //
-      // CPU 높은 서버 조회
-      //
-      if (
-        query.includes("cpu") ||
-        query.includes("씨피유") ||
-        query.includes("서버")
-      ) {
+      if (q.includes("cpu") || q.includes("씨피유") || q.includes("서버")) {
         const nowSec = Math.floor(Date.now() / 1000);
         const fromSec = nowSec - 5 * 60;
 
@@ -610,12 +599,10 @@ const queryDatadogTool = llmobs.wrap(
           type: "metrics",
           metric: "system.cpu.user",
           time_range: "last_5_minutes",
-          query:
-            "top(avg:system.cpu.user{*} by {host}, 10, 'mean', 'desc')",
+          query: "top(avg:system.cpu.user{*} by {host}, 10, 'mean', 'desc')",
           count: series.length,
           hosts: series.map((item) => {
-            const pointlist = item.pointlist || [];
-            const values = pointlist
+            const values = (item.pointlist || [])
               .map((point) => point?.[1])
               .filter((value) => typeof value === "number");
 
@@ -634,30 +621,24 @@ const queryDatadogTool = llmobs.wrap(
         };
       }
 
-      //
-      // Incident 조회
-      //
       if (
-        query.includes("incident") ||
-        query.includes("장애") ||
-        query.includes("문제")
+        q.includes("incident") ||
+        q.includes("장애") ||
+        q.includes("문제")
       ) {
-        const result =
-          await incidentsApi.listIncidents();
+        const result = await incidentsApi.listIncidents();
 
         return {
           source: "datadog",
           type: "incidents",
           count: result.data?.length || 0,
-          incidents:
-            result.data?.slice(0, 5) || [],
+          incidents: result.data?.slice(0, 5) || [],
         };
       }
 
       return {
         source: "datadog",
-        message:
-          "현재는 Incident 조회만 지원합니다.",
+        message: "현재는 CPU 메트릭과 Incident 조회를 지원합니다.",
       };
     } catch (error) {
       return {
@@ -673,7 +654,7 @@ const embedUserQuery = llmobs.wrap(
   async function embedUserQuery(queryText) {
     const safeQuery = String(queryText ?? "");
 
-    const response = await client.embeddings.create({
+    const response = await openaiClient.embeddings.create({
       model: EMBEDDING_MODEL,
       input: safeQuery,
     });
@@ -747,35 +728,25 @@ function buildToolDefinitions() {
         },
       },
     },
-
     {
       type: "function",
       function: {
         name: "query_datadog",
-
-        description:
-          "Query Datadog incidents and observability data",
-
+        description: "Query Datadog incidents and observability data",
         parameters: {
           type: "object",
-
           properties: {
             query: {
               type: "string",
             },
           },
-
           required: ["query"],
-
           additionalProperties: false,
         },
       },
     },
   ];
 }
-
-
-
 
 function estimateCost({ promptTokens = 0, completionTokens = 0 }) {
   const inputCostPer1M = 0.4;
@@ -788,9 +759,289 @@ function estimateCost({ promptTokens = 0, completionTokens = 0 }) {
   return cost.toFixed(6);
 }
 
-/**
- * 헬스체크
- */
+function buildSystemPrompt({ provider, model }) {
+  return `
+You are a helpful assistant for a Datadog demo application.
+
+Current provider:
+${provider}
+
+Current model:
+${model}
+
+IMPORTANT RULES:
+- If the user asks about current time, use get_current_time.
+- If the user asks about Datadog incidents, outages, failures, alerts, monitors, logs, traces, metrics, infrastructure or observability, use query_datadog.
+- Do not invent Datadog data.
+- Always use tools when Datadog information is requested.
+- Use retrieved context if provided.
+
+MODEL RULES:
+- If the user asks which model is running, answer with provider and model.
+- Never guess the model name.
+`.trim();
+}
+
+async function runAzureFoundryModel({
+  provider,
+  model,
+  baseMessages,
+  docsContext,
+}) {
+  const endpoint = process.env.AZURE_OPENAI_ENDPOINT?.trim();
+  const apiKey = process.env.AZURE_OPENAI_API_KEY?.trim();
+
+  if (!endpoint || !apiKey) {
+    throw new Error("Azure Foundry endpoint or API key is not configured");
+  }
+
+  const startedAt = Date.now();
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": apiKey,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "system",
+          content: buildSystemPrompt({ provider, model }),
+        },
+        ...baseMessages,
+        ...(docsContext
+          ? [{ role: "system", content: docsContext }]
+          : []),
+      ],
+    }),
+  });
+
+const text = await response.text();
+
+console.log("===== Azure Response =====");
+console.log(text);
+console.log("ENDPOINT =", process.env.AZURE_OPENAI_ENDPOINT);
+console.log("MODEL =", process.env.AZURE_OPENAI_MODEL);
+console.log("KEY =", process.env.AZURE_OPENAI_API_KEY.substring(0, 10));
+let data = null;
+
+try {
+    data = text ? JSON.parse(text) : null;
+} catch {
+    data = { raw: text };
+}
+
+if (!response.ok){
+logApiError({
+    req:null,
+    event:"azure_request_failed",
+    error:new Error(`Azure HTTP ${response.status}`),
+    recoverable:true,
+    metadata:{
+        endpoint,
+        model,
+        status_code:response.status,
+        response:data
+    }
+});
+}
+
+  const content =
+    data?.choices?.[0]?.message?.content ||
+    data?.choices?.[0]?.text ||
+    data?.output_text ||
+    "응답이 비어 있습니다.";
+
+  const promptTokens = data?.usage?.prompt_tokens ?? 0;
+  const completionTokens = data?.usage?.completion_tokens ?? 0;
+
+  return {
+    provider,
+    model: data?.model || model,
+    content,
+    promptTokens,
+    completionTokens,
+    totalTokens: Number(promptTokens) + Number(completionTokens),
+    latencyMs: Date.now() - startedAt,
+    costEstimate: estimateCost({
+      promptTokens,
+      completionTokens,
+    }),
+    usedTools: [],
+  };
+}
+
+async function executeToolCall({ toolCall, conversationId, userId, provider }) {
+
+  const toolName = toolCall.function?.name;
+  const parsedArgs = safeJsonParse(toolCall.function?.arguments || "{}");
+
+  let toolResult;
+
+  if (toolName === "get_current_time") {
+    toolResult = getCurrentTimeTool();
+  } else if (toolName === "query_datadog") {
+    toolResult = await queryDatadogTool(parsedArgs.query);
+  } else {
+    toolResult = {
+      error: `Unknown tool: ${toolName}`,
+    };
+  }
+
+  logger.info("chat_tool_executed", {
+    user_id: userId,
+    conversation_id: conversationId,
+    provider,
+    tool_name: toolName,
+    tool_args: parsedArgs,
+    tool_result: toolResult,
+  });
+
+  await createMessage({
+    conversationId,
+    role: "tool",
+    content: JSON.stringify(toolResult),
+    metadata: {
+      provider,
+      tool_call_id: toolCall.id,
+      tool_name: toolName,
+      tool_args: parsedArgs,
+      source: "tool_execution",
+      user_id: userId,
+    },
+  });
+
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: JSON.stringify(toolResult),
+  };
+}
+
+async function runModelWithTools({
+  provider,
+  client,
+  model,
+  baseMessages,
+  docsContext,
+  conversationId,
+  userId,
+}) 
+
+{
+  if (!client) {
+    throw new Error(`${provider} client is not configured`);
+  }
+
+ 
+
+  const firstStartedAt = Date.now();
+
+  const firstCompletion = await client.chat.completions.create({
+    model,
+    messages: [
+      {
+        role: "system",
+        content: buildSystemPrompt({ provider, model }),
+      },
+      ...baseMessages,
+      ...(docsContext ? [{ role: "system", content: docsContext }] : []),
+    ],
+    tools: buildToolDefinitions(),
+    tool_choice: "auto",
+  });
+
+  const firstLatencyMs = Date.now() - firstStartedAt;
+  const firstMessage = firstCompletion.choices?.[0]?.message;
+  const toolCalls = firstMessage?.tool_calls || [];
+
+  let finalModel = firstCompletion.model || model;
+  let finalPromptTokens = firstCompletion.usage?.prompt_tokens ?? 0;
+  let finalCompletionTokens = firstCompletion.usage?.completion_tokens ?? 0;
+  let finalLatencyMs = firstLatencyMs;
+  let answer = firstMessage?.content || "응답이 비어 있습니다.";
+
+  if (toolCalls.length > 0) {
+    const secondMessages = [
+      {
+        role: "system",
+        content: buildSystemPrompt({ provider, model }),
+      },
+      ...baseMessages,
+      ...(docsContext ? [{ role: "system", content: docsContext }] : []),
+      {
+        role: "assistant",
+        content: firstMessage.content || "",
+        tool_calls: toolCalls,
+      },
+    ];
+
+    const executedToolKeys = new Set();
+
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.function?.name;
+      const parsedArgs = safeJsonParse(toolCall.function?.arguments || "{}");
+      const toolKey = `${toolName}:${JSON.stringify(parsedArgs)}`;
+
+      if (executedToolKeys.has(toolKey)) continue;
+      executedToolKeys.add(toolKey);
+
+      const toolMessage = await executeToolCall({
+        toolCall,
+        conversationId,
+        userId,
+        provider,
+      });
+
+      secondMessages.push(toolMessage);
+    }
+
+    const secondStartedAt = Date.now();
+
+    const secondCompletion = await client.chat.completions.create({
+      model,
+      messages: secondMessages,
+    });
+
+    finalLatencyMs = firstLatencyMs + (Date.now() - secondStartedAt);
+    finalModel = secondCompletion.model || model;
+    finalPromptTokens = secondCompletion.usage?.prompt_tokens ?? 0;
+    finalCompletionTokens = secondCompletion.usage?.completion_tokens ?? 0;
+    answer =
+      secondCompletion.choices?.[0]?.message?.content || "응답이 비어 있습니다.";
+  }
+
+  const totalTokens =
+    Number(finalPromptTokens || 0) + Number(finalCompletionTokens || 0);
+
+  return {
+    provider,
+    model: finalModel,
+    content: answer,
+    promptTokens: finalPromptTokens,
+    completionTokens: finalCompletionTokens,
+    totalTokens,
+    latencyMs: finalLatencyMs,
+    costEstimate: estimateCost({
+      promptTokens: finalPromptTokens,
+      completionTokens: finalCompletionTokens,
+    }),
+    usedTools: toolCalls.map((t) => t.function?.name).filter(Boolean),
+  };
+}
+
+app.get("/health", (_req, res) => {
+  return res.json({
+    ok: true,
+    service: process.env.DD_SERVICE || "shlim-toy-chat-api",
+    openaiModel: OPENAI_MODEL,
+    azureOpenAIModel: AZURE_OPENAI_MODEL,
+    azureEnabled: Boolean(azureClient),
+  });
+});
+
 app.get("/monitoring/test", (_req, res) => {
   return res.json({
     ok: true,
@@ -833,6 +1084,16 @@ function monitoringGetResourceFromScope(scope = "") {
   return match?.[1] || "unknown";
 }
 
+function monitoringGetUserFromScope(scope = "") {
+  const match =
+    String(scope).match(/usr\.name:([^,\s]+)/) ||
+    String(scope).match(/usr_name:([^,\s]+)/) ||
+    String(scope).match(/user\.name:([^,\s]+)/) ||
+    String(scope).match(/name:([^,\s]+)/);
+
+  return match?.[1] || "unknown";
+}
+
 function monitoringGetSeriesValues(pointlist = []) {
   return pointlist
     .map((point) => point?.[1])
@@ -869,6 +1130,12 @@ function monitoringFormatLatency(value) {
   }
 
   return `${num.toFixed(2)} s`;
+}
+
+function monitoringFormatSessions(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  const count = Math.round(Number(value));
+  return count === 1 ? "1 session" : `${count} sessions`;
 }
 
 function monitoringGetTopCpuHosts(result, limit = 3) {
@@ -939,12 +1206,27 @@ function monitoringGetTopLatencyResources(result, limit = 3) {
     .slice(0, limit);
 }
 
+function monitoringGetTopVisitorUsers(result, limit = 3) {
+  return (result.series || [])
+    .map((item) => {
+      const total = monitoringTotal(
+        monitoringGetSeriesValues(item.pointlist || [])
+      );
+
+      return {
+        username: monitoringGetUserFromScope(item.scope),
+        value: total,
+        displayValue: monitoringFormatSessions(total),
+      };
+    })
+    .filter((item) => item.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
 app.get("/api/monitoring/summary", async (req, res) => {
-  console.log("MONITORING API START");
   try {
     const { fromSec, toSec } = monitoringGetTodayRangeSecKST();
-
-    const visitorsService = "shlim-toy-chat-front";
 
     const [cpuIdleResult, memoryUsableResult, latencyResult, visitorsResult] =
       await Promise.all([
@@ -967,13 +1249,9 @@ app.get("/api/monitoring/summary", async (req, res) => {
         metricsApi.queryMetrics({
           from: fromSec,
           to: toSec,
-          query:
-            "sum:custom.user{*} by {usr.name}.as_count()",
+          query: "sum:custom.user{*} by {usr.name}.as_count()",
         }),
       ]);
-
-      console.log("===== VISITORS RESULT =====");
-      console.log(JSON.stringify(visitorsResult, null, 2));
 
     const topCpuHosts = monitoringGetTopCpuHosts(cpuIdleResult, 3);
     const topMemoryHosts = monitoringGetTopMemoryHosts(memoryUsableResult, 3);
@@ -981,47 +1259,8 @@ app.get("/api/monitoring/summary", async (req, res) => {
       latencyResult,
       3
     );
-
-function monitoringGetUserFromScope(scope = "") {
-  const match =
-    String(scope).match(/usr\.name:([^,\s]+)/) ||
-    String(scope).match(/usr_name:([^,\s]+)/) ||
-    String(scope).match(/user\.name:([^,\s]+)/) ||
-    String(scope).match(/name:([^,\s]+)/);
-
-  return match?.[1] || "unknown";
-}
-
-function monitoringFormatSessions(value) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-
-  const count = Math.round(Number(value));
-  return count === 1 ? "1 session" : `${count} sessions`;
-}
-
-function monitoringGetTopVisitorUsers(result, limit = 3) {
-  return (result.series || [])
-    .map((item) => {
-      const total = monitoringTotal(
-        monitoringGetSeriesValues(item.pointlist || [])
-      );
-
-      return {
-        username: monitoringGetUserFromScope(item.scope),
-        value: total,
-        displayValue: monitoringFormatSessions(total),
-      };
-    })
-    .filter((item) => item.value > 0)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-const topVisitorUsers = monitoringGetTopVisitorUsers(visitorsResult, 3);
-
-const visitorsTotal = monitoringTotal(
-  monitoringGetAllValues(visitorsResult)
-);
+    const topVisitorUsers = monitoringGetTopVisitorUsers(visitorsResult, 3);
+    const visitorsTotal = monitoringTotal(monitoringGetAllValues(visitorsResult));
 
     return res.json({
       range: {
@@ -1035,27 +1274,31 @@ const visitorsTotal = monitoringTotal(
         latency: topLatencyResources[0]?.displayValue || "-",
         visitors: `${Math.round(visitorsTotal)} sessions`,
       },
-details: {
-  cpuHosts: topCpuHosts,
-  memoryHosts: topMemoryHosts,
-  latencyResources: topLatencyResources,
-  visitorsUsers: topVisitorUsers,
-},
+      details: {
+        cpuHosts: topCpuHosts,
+        memoryHosts: topMemoryHosts,
+        latencyResources: topLatencyResources,
+        visitorsUsers: topVisitorUsers,
+      },
+    });
+  } catch (error) {
+    logApiError({
+      req,
+      event: "monitoring_summary_failed",
+      error,
+      recoverable: true,
+      metadata: {
+        datadog_site: process.env.DD_SITE,
+      },
     });
 
-    
-  } catch (error) {
-    console.error("monitoring_summary_failed:", error);
-
     return res.status(500).json({
-      error: error?.message || "failed to load monitoring summary",
+      error: "monitoring_summary_failed",
+      message: error?.message || "failed to load monitoring summary",
     });
   }
 });
 
-/**
- * 인증
- */
 app.post("/auth/register", async (req, res) => {
   try {
     const { name, email, password } = req.body ?? {};
@@ -1080,6 +1323,7 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const passwordHash = await hashPassword(String(password));
+
     const user = await createUser({
       name: String(name).trim(),
       email: normalizedEmail,
@@ -1088,20 +1332,29 @@ app.post("/auth/register", async (req, res) => {
 
     const token = signToken(user);
 
-    logger.info("auth_register_success", {
-      user_id: user.id,
-      email: user.email,
-    });
+logApiInfo({
+  req,
+  event: "auth_register_success",
+  userId: user.id,
+  metadata: {
+    email: user.email,
+  },
+});
 
     return res.json({
       token,
       user,
     });
   } catch (error) {
-    logger.error("auth_register_failed", {
-      error_message: error.message,
-      error_stack: error.stack,
-    });
+logApiError({
+    req,
+    event: "auth_register_failed",
+    error,
+    recoverable:false,
+    metadata:{
+        email:req.body?.email
+    }
+});
 
     markSpanError(error, {
       "app.feature": "auth",
@@ -1136,6 +1389,16 @@ app.post("/auth/login", async (req, res) => {
     const user = await getUserByEmail(normalizedEmail);
 
     if (!user) {
+      logApiWarn({
+        req,
+        event: "auth_login_failed",
+        reason: "user_not_found",
+        recoverable: true,
+        metadata: {
+          email: normalizedEmail,
+        },
+      });
+
       return res.status(404).json({
         error: "user_not_found",
         message: "존재하지 않는 이메일입니다.",
@@ -1145,6 +1408,17 @@ app.post("/auth/login", async (req, res) => {
     const matched = await comparePassword(String(password), user.password_hash);
 
     if (!matched) {
+      logApiWarn({
+        req,
+        event: "auth_login_failed",
+        reason: "invalid_password",
+        recoverable: true,
+        metadata: {
+          email: normalizedEmail,
+          user_id: user.id,
+        },
+      });
+
       return res.status(401).json({
         error: "invalid_password",
         message: "비밀번호가 올바르지 않습니다.",
@@ -1161,19 +1435,28 @@ app.post("/auth/login", async (req, res) => {
 
     const token = signToken(safeUser);
 
-    logger.info("auth_login_success", {
-      user_id: safeUser.id,
-      email: safeUser.email,
-    });
+logApiInfo({
+  req,
+  event: "auth_login_success",
+  userId: safeUser.id,
+  metadata: {
+    email: safeUser.email,
+  },
+});
 
     return res.json({
       token,
       user: safeUser,
     });
   } catch (error) {
-    logger.error("auth_login_failed", {
-      error_message: error.message,
-      error_stack: error.stack,
+    logApiError({
+      req,
+      event: "auth_login_failed",
+      error,
+      recoverable: false,
+      metadata: {
+        email: req.body?.email,
+      },
     });
 
     markSpanError(error, {
@@ -1198,11 +1481,13 @@ app.get("/auth/me", authRequired, async (req, res) => {
 
     return res.json({ user });
   } catch (error) {
-    logger.error("auth_me_failed", {
-      user_id: req.user?.userId,
-      error_message: error.message,
-      error_stack: error.stack,
-    });
+logApiError({
+    req,
+    event:"auth_me_failed",
+    error,
+    userId:req.user?.userId,
+    recoverable:false
+});
 
     markSpanError(error, {
       "app.feature": "auth",
@@ -1216,9 +1501,6 @@ app.get("/auth/me", authRequired, async (req, res) => {
   }
 });
 
-/**
- * 대화 목록 조회
- */
 app.get("/conversations", authRequired, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -1231,11 +1513,13 @@ app.get("/conversations", authRequired, async (req, res) => {
 
     return res.json({ conversations });
   } catch (error) {
-    logger.error("conversations_failed", {
-      user_id: req.user?.userId,
-      error_message: error.message,
-      error_stack: error.stack,
-    });
+logApiError({
+    req,
+    event:"conversations_failed",
+    error,
+    userId:req.user?.userId,
+    recoverable:false
+});
 
     markSpanError(error, {
       "app.feature": "conversations",
@@ -1249,9 +1533,6 @@ app.get("/conversations", authRequired, async (req, res) => {
   }
 });
 
-/**
- * 특정 대화 메시지 조회
- */
 app.get(
   "/conversations/:conversationId/messages",
   authRequired,
@@ -1260,7 +1541,10 @@ app.get(
       const { conversationId } = req.params;
       const userId = req.user.userId;
 
-      const conversation = await getConversationByIdForUser(conversationId, userId);
+      const conversation = await getConversationByIdForUser(
+        conversationId,
+        userId
+      );
 
       if (!conversation) {
         return res.status(404).json({ error: "conversation not found" });
@@ -1268,20 +1552,29 @@ app.get(
 
       const messages = await getMessagesByConversationId(conversationId);
 
+      const normalizedMessages = messages.map((msg) => ({
+        ...msg,
+        provider: msg.metadata?.provider || null,
+        model: msg.metadata?.model || null,
+        trace: msg.metadata?.trace || null,
+      }));
+
       logger.info("conversation_messages_request_success", {
         user_id: userId,
         conversation_id: conversationId,
         message_count: messages.length,
       });
 
-      return res.json({ messages });
+      return res.json({ messages: normalizedMessages });
     } catch (error) {
-      logger.error("conversation_messages_failed", {
-        user_id: req.user?.userId,
-        conversation_id: req.params?.conversationId,
-        error_message: error.message,
-        error_stack: error.stack,
-      });
+logApiError({
+    req,
+    event:"conversation_messages_failed",
+    error,
+    userId:req.user?.userId,
+    conversationId:req.params.conversationId,
+    recoverable:false
+});
 
       markSpanError(error, {
         "app.feature": "conversation_messages",
@@ -1297,9 +1590,6 @@ app.get(
   }
 );
 
-/**
- * 채팅
- */
 app.post("/chat", authRequired, async (req, res) => {
   const requestSpan = tracer.scope().active();
   const { conversationId, message, forceError } = req.body ?? {};
@@ -1309,24 +1599,22 @@ app.post("/chat", authRequired, async (req, res) => {
     if (forceError === true) {
       const error = new Error("Intentional backend error for demo");
 
-      if (requestSpan) {
-        requestSpan.setTag("error", true);
-        requestSpan.setTag("error.type", error.name);
-        requestSpan.setTag("error.message", error.message);
-        requestSpan.setTag("http.status_code", 500);
-        requestSpan.setTag("app.error.handled", true);
-      }
-
-      logger.error("chat_request_failed", {
-        user_id: userId,
-        conversation_id: conversationId || "new",
-        request_body: req.body,
-        error_message: error.message,
-        error_stack: error.stack,
+      logApiError({
+        req,
+        event: "chat_request_failed",
+        error,
+        userId,
+        conversationId,
+        recoverable: false,
+        metadata: {
+          reason: "forced_demo_error",
+          message_preview: String(message ?? "").slice(0, 100),
+        },
       });
 
       return res.status(500).json({
-        error: error.message,
+        error: "forced_demo_error",
+        message: error.message,
       });
     }
 
@@ -1334,26 +1622,56 @@ app.post("/chat", authRequired, async (req, res) => {
       return res.status(400).json({ error: "message is required" });
     }
 
-    logger.info("chat_request_received", {
-      user_id: userId,
-      conversation_id: conversationId || "new",
-      request_body: req.body,
-    });
+logChatRequest({
+  userId,
+  conversationId: conversationId || "new",
+  requestId: req.requestId,
+  message,
+  provider: "compare",
+  model: `${OPENAI_MODEL} / ${AZURE_OPENAI_MODEL}`,
+});
 
     let conversation;
 
-    if (conversationId) {
-      conversation = await getConversationByIdForUser(conversationId, userId);
+if (conversationId) {
+  conversation = await getConversationByIdForUser(conversationId, userId);
 
-      if (!conversation) {
-        return res.status(404).json({ error: "conversation not found" });
-      }
-    } else {
-      conversation = await createConversation({
-        userId,
-        title: String(message).slice(0, 30),
-      });
-    }
+  if (!conversation) {
+logApiWarn({
+  req,
+  event: "conversation_validation_failed",
+  userId,
+  conversationId,
+  reason: "conversation_not_found",
+  recoverable: true,
+  metadata: {
+    action: "create_new_conversation",
+    message_preview: String(message).slice(0, 120),
+  },
+});
+
+    conversation = await createConversation({
+      userId,
+      title: String(message).slice(0, 30),
+    });
+
+logApiInfo({
+  req,
+  event: "conversation_auto_recovered",
+  userId,
+  conversationId: conversation.id,
+  metadata: {
+    old_conversation_id: conversationId,
+    new_conversation_id: conversation.id,
+  },
+});
+  }
+} else {
+  conversation = await createConversation({
+    userId,
+    title: String(message).slice(0, 30),
+  });
+}
 
     const activeSpan = tracer.scope().active();
 
@@ -1362,20 +1680,16 @@ app.post("/chat", authRequired, async (req, res) => {
       activeSpan.setTag("app.route", "POST /chat");
       activeSpan.setTag("app.user_id", userId);
       activeSpan.setTag("app.conversation_id", conversation.id);
+      activeSpan.setTag("app.llm.compare.enabled", true);
       setRequestBodyOnSpan(activeSpan, req.body);
 
-      if (req.body?.message) {
-        activeSpan.setTag(
-          "app.request.message",
-          String(req.body.message).slice(0, 50)
-        );
-      }
+      activeSpan.setTag("app.request.message", String(message).slice(0, 50));
     }
 
     const result = await llmobs.trace(
       {
         kind: "agent",
-        name: "chat_agent",
+        name: "chat_agent_compare_models",
         sessionId: String(userId),
         mlApp: ML_APP,
       },
@@ -1383,7 +1697,7 @@ app.post("/chat", authRequired, async (req, res) => {
         const workflowResult = await llmobs.trace(
           {
             kind: "workflow",
-            name: "process_chat_request",
+            name: "process_chat_request_compare_models",
             sessionId: String(userId),
             mlApp: ML_APP,
           },
@@ -1404,34 +1718,13 @@ app.post("/chat", authRequired, async (req, res) => {
               .filter((msg) => msg.role === "user" || msg.role === "assistant")
               .slice(-8);
 
-            const llmMessages = [
-              {
-                role: "system",
-                content: `
-You are a helpful assistant for a Datadog demo application.
-
-Current OpenAI model:
-${OPENAI_MODEL}
-
-IMPORTANT RULES:
-
-- If the user asks about current time, use get_current_time.
-- If the user asks about Datadog incidents, outages, failures, alerts, monitors, logs, traces, metrics, infrastructure or observability, use query_datadog.
-- Do not invent Datadog data.
-- Always use tools when Datadog information is requested.
-- Use retrieved context if provided.
-
-MODEL RULES:
-- If the user asks which model is running, answer exactly with the model name shown above.
-- Never say GPT-4 unless the model name above is GPT-4.
-- Never guess the model name.
-`.trim(),
-              },
-              ...recentHistory.map((msg) => ({
-                role: msg.role,
-                content: msg.content,
-              })),
-            ];
+            const baseMessages = recentHistory.map((msg) => ({
+              role: msg.role,
+              content:
+                msg.role === "assistant" && msg.metadata?.provider
+                  ? `[${msg.metadata.provider} / ${msg.metadata.model || "unknown"}]\n${msg.content}`
+                  : msg.content,
+            }));
 
             const intent = classifyUserIntent(String(message));
 
@@ -1445,19 +1738,7 @@ MODEL RULES:
             let retrievedChunks = [];
 
             if (intent.needDocs) {
-              logger.info("chat_before_query_embedding", {
-                user_id: userId,
-                conversation_id: conversation.id,
-                message_preview: String(message).slice(0, 120),
-              });
-
               const queryEmbedding = await embedUserQuery(String(message));
-
-              logger.info("chat_after_query_embedding", {
-                user_id: userId,
-                conversation_id: conversation.id,
-                embedding_length: queryEmbedding.length,
-              });
 
               retrievedChunks = retrieveRelevantChunks({
                 query: String(message),
@@ -1483,191 +1764,176 @@ MODEL RULES:
                   retrievedChunks
                     .map(
                       (chunk, idx) =>
-                        `${idx + 1}. ${chunk.docId}\n${chunk.text}\n(score: ${chunk.score.toFixed(4)})`
+                        `${idx + 1}. ${chunk.docId}\n${chunk.text}\n(score: ${chunk.score.toFixed(
+                          4
+                        )})`
                     )
                     .join("\n\n")
                 : "";
 
-            const firstStartedAt = Date.now();
+const modelJobs = [
+  {
+    provider: "OpenAI",
+    runner: () =>
+      runModelWithTools({
+        provider: "OpenAI",
+        client: openaiClient,
+        model: OPENAI_MODEL,
+        baseMessages,
+        docsContext,
+        conversationId: conversation.id,
+        userId,
+      }),
+  },
+  {
+    provider: "Azure AI",
+    runner: () =>
+      runAzureFoundryModel({
+        provider: "Azure AI",
+        model: AZURE_OPENAI_MODEL,
+        baseMessages,
+        docsContext,
+      }),
+  },
+];
 
-            const firstCompletion = await client.chat.completions.create({
-              model: OPENAI_MODEL,
-              messages: [
-                ...llmMessages,
-                ...(docsContext ? [{ role: "system", content: docsContext }] : []),
-              ],
-              tools: buildToolDefinitions(),
-              tool_choice: "auto",
-            });
+const settled = await Promise.allSettled(
+  modelJobs.map((job) => job.runner())
+);
+console.log("===== SETTLED RESULT =====");
+console.log(
+  settled.map((item, index) => ({
+    index,
+    provider: modelJobs[index]?.provider,
+    status: item.status,
+    reason: item.status === "rejected" ? item.reason?.message : undefined,
+  }))
+);
 
-            const firstLatencyMs = Date.now() - firstStartedAt;
+            const responses = [];
 
-            const firstMessage = firstCompletion.choices?.[0]?.message;
-            const toolCalls = firstMessage?.tool_calls || [];
+            for (let index = 0; index < settled.length; index += 1) {
+              const job = modelJobs[index];
+              const item = settled[index];
 
-            let finalModel = firstCompletion.model;
-            let finalPromptTokens = firstCompletion.usage?.prompt_tokens ?? 0;
-            let finalCompletionTokens =
-              firstCompletion.usage?.completion_tokens ?? 0;
-            let finalLatencyMs = firstLatencyMs;
-            let answer = firstMessage?.content || "응답이 비어 있습니다.";
+              if (item.status === "fulfilled") {
+                const value = item.value;
 
-            if (toolCalls.length > 0) {
-              const secondMessages = [
-                ...llmMessages,
-                ...(docsContext ? [{ role: "system", content: docsContext }] : []),
-                {
-                  role: "assistant",
-                  content: firstMessage.content || "",
-                  tool_calls: toolCalls,
-                },
-              ];
-
-              const executedToolKeys = new Set();
-
-              for (const toolCall of toolCalls) {
-                const toolName = toolCall.function?.name;
-                const parsedArgs = safeJsonParse(
-                  toolCall.function?.arguments || "{}"
-                );
-                const toolKey = `${toolName}:${JSON.stringify(parsedArgs)}`;
-
-                if (executedToolKeys.has(toolKey)) continue;
-                executedToolKeys.add(toolKey);
-
-                let toolResult;
-
-if (toolName === "get_current_time") {
-
-  toolResult =
-    getCurrentTimeTool();
-
-} else if (
-  toolName === "query_datadog"
-) {
-
-  toolResult =
-    await queryDatadogTool(
-      parsedArgs.query
-    );
-
-} else {
-
-  toolResult = {
-    error: `Unknown tool: ${toolName}`,
-  };
-
-}
-
-                logger.info("chat_tool_executed", {
-                  user_id: userId,
-                  conversation_id: conversation.id,
-                  tool_name: toolName,
-                  tool_args: parsedArgs,
-                  tool_result: toolResult,
-                });
-
-                await createMessage({
+                const assistantMessage = await createMessage({
                   conversationId: conversation.id,
-                  role: "tool",
-                  content: JSON.stringify(toolResult),
+                  role: "assistant",
+                  content: value.content,
                   metadata: {
-                    tool_call_id: toolCall.id,
-                    tool_name: toolName,
-                    tool_args: parsedArgs,
-                    source: "tool_execution",
+                    provider: value.provider,
+                    model: value.model,
+                    input_tokens: value.promptTokens,
+                    output_tokens: value.completionTokens,
+                    total_tokens: value.totalTokens,
+                    latency_ms: value.latencyMs,
+                    cost_estimate: value.costEstimate,
+                    used_tools: value.usedTools.length > 0,
+                    tool_names: value.usedTools,
+                    retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
+                    retrieval_count: retrievedChunks.length,
                     user_id: userId,
                   },
                 });
 
-                secondMessages.push({
-                  role: "tool",
-                  tool_call_id: toolCall.id,
-                  content: JSON.stringify(toolResult),
+                responses.push({
+                  id: assistantMessage?.id ?? `assistant-${Date.now()}-${index}`,
+                  role: "assistant",
+                  provider: value.provider,
+                  model: value.model,
+                  content: value.content,
+                  created_at:
+                    assistantMessage?.created_at || new Date().toISOString(),
+                  trace: {
+                    provider: value.provider,
+                    model: value.model,
+                    totalLatencyMs: value.latencyMs,
+                    totalTokens: value.totalTokens,
+                    costEstimate: value.costEstimate,
+                    promptTokens: value.promptTokens,
+                    completionTokens: value.completionTokens,
+                    usedTools: value.usedTools,
+                    retrievalCount: retrievedChunks.length,
+                  },
                 });
+
+logLlmCompleted({
+  userId,
+  conversationId: conversation.id,
+  requestId: req.requestId,
+  provider: value.provider,
+  model: value.model,
+  durationMs: value.latencyMs,
+  promptTokens: value.promptTokens,
+  completionTokens: value.completionTokens,
+  totalTokens: value.totalTokens,
+  costEstimate: value.costEstimate,
+  toolCalls: value.usedTools,
+  retrievalCount: retrievedChunks.length,
+});
+              } else {
+                const errorMessage =
+                  item.reason?.message || `${job.provider} request failed`;
+
+                const assistantMessage = await createMessage({
+                  conversationId: conversation.id,
+                  role: "assistant",
+                  content: `에러 발생: ${errorMessage}`,
+                  metadata: {
+                    provider: job.provider,
+                    model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+                    error: errorMessage,
+                    user_id: userId,
+                  },
+                });
+
+                responses.push({
+                  id: assistantMessage?.id ?? `assistant-error-${Date.now()}`,
+                  role: "assistant",
+                  provider: job.provider,
+                  model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+                  content: `에러 발생: ${errorMessage}`,
+                  created_at:
+                    assistantMessage?.created_at || new Date().toISOString(),
+                  trace: {
+                    provider: job.provider,
+                    model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+                    error: errorMessage,
+                  },
+                });
+
+logLlmFailed({
+  userId,
+  conversationId: conversation.id,
+  requestId: req.requestId,
+  provider: job.provider,
+  model: job.provider === "Azure AI" ? AZURE_OPENAI_MODEL : OPENAI_MODEL,
+  stage: "chat_model_compare",
+  error: item.reason,
+});
               }
-
-              const secondStartedAt = Date.now();
-
-              const secondCompletion = await client.chat.completions.create({
-                model: OPENAI_MODEL,
-                messages: secondMessages,
-              });
-
-              finalLatencyMs = firstLatencyMs + (Date.now() - secondStartedAt);
-              finalModel = secondCompletion.model;
-              finalPromptTokens = secondCompletion.usage?.prompt_tokens ?? 0;
-              finalCompletionTokens =
-                secondCompletion.usage?.completion_tokens ?? 0;
-              answer =
-                secondCompletion.choices?.[0]?.message?.content ||
-                "응답이 비어 있습니다.";
             }
 
-            const assistantMessage = await createMessage({
-              conversationId: conversation.id,
-              role: "assistant",
-              content: answer,
-              metadata: {
-                model: finalModel,
-                input_tokens: finalPromptTokens,
-                output_tokens: finalCompletionTokens,
-                latency_ms: finalLatencyMs,
-                used_tools: toolCalls.length > 0,
-                tool_names: toolCalls
-                  .map((t) => t.function?.name)
-                  .filter(Boolean),
-                retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
-                retrieval_count: retrievedChunks.length,
-                user_id: userId,
-              },
-            });
-
-            logger.info("chat_request_completed", {
-              user_id: userId,
-              conversation_id: conversation.id,
-              model: finalModel,
-              latency_ms: finalLatencyMs,
-              prompt_tokens: finalPromptTokens,
-              completion_tokens: finalCompletionTokens,
-              used_tools: toolCalls.map((t) => t.function?.name).filter(Boolean),
-              retrieval_count: retrievedChunks.length,
-            });
-
-            if (activeSpan) {
-              activeSpan.setTag("app.llm.model", finalModel || "unknown");
-              activeSpan.setTag("app.llm.latency_ms", finalLatencyMs);
-              activeSpan.setTag("app.llm.input_tokens", finalPromptTokens);
-              activeSpan.setTag("app.llm.output_tokens", finalCompletionTokens);
-              activeSpan.setTag("app.tool.used", toolCalls.length > 0);
-              activeSpan.setTag("app.tool.count", toolCalls.length);
-              activeSpan.setTag("app.retrieval.count", retrievedChunks.length);
-              activeSpan.setTag("app.rag.embedding_model", EMBEDDING_MODEL);
-              activeSpan.setTag("app.rag.chunk_size", RAG_CHUNK_SIZE);
-              activeSpan.setTag("app.rag.chunk_overlap", RAG_CHUNK_OVERLAP);
-              activeSpan.setTag("app.rag.top_k", RAG_TOP_K);
-              activeSpan.setTag(
-                "app.response.message",
-                String(answer).slice(0, 100)
-              );
-            }
+            const outputText = responses
+              .map(
+                (item) =>
+                  `[${item.provider} / ${item.model}]\n${item.content}`
+              )
+              .join("\n\n---\n\n");
 
             llmobs.annotate(undefined, {
               inputData: String(message),
-              outputData: answer,
+              outputData: outputText,
               metadata: {
-                message: answer,
+                message: outputText,
               },
             });
 
             return {
-              answer,
-              assistantMessage,
-              finalModel,
-              finalPromptTokens,
-              finalCompletionTokens,
-              finalLatencyMs,
-              usedTools: toolCalls.map((t) => t.function?.name).filter(Boolean),
+              responses,
               retrievedChunks,
             };
           }
@@ -1675,64 +1941,103 @@ if (toolName === "get_current_time") {
 
         llmobs.annotate(undefined, {
           inputData: String(message),
-          outputData: workflowResult.answer,
-          metadata: {
-            message: workflowResult.answer,
-          },
+          outputData: workflowResult.responses
+            .map((item) => `[${item.provider}] ${item.content}`)
+            .join("\n\n"),
         });
 
         return workflowResult;
       }
     );
 
-    const totalTokens =
-      Number(result.finalPromptTokens || 0) +
-      Number(result.finalCompletionTokens || 0);
+    const successfulTraces = result.responses
+      .map((item) => item.trace)
+      .filter((trace) => !trace.error);
+
+    const firstResponse = result.responses[0];
 
     const trace = {
-      model: result.finalModel || OPENAI_MODEL,
-      totalLatencyMs: result.finalLatencyMs,
-      totalTokens,
-      costEstimate: estimateCost({
-        promptTokens: result.finalPromptTokens,
-        completionTokens: result.finalCompletionTokens,
-      }),
-      promptTokens: result.finalPromptTokens,
-      completionTokens: result.finalCompletionTokens,
-      usedTools: result.usedTools,
+      model: result.responses
+        .map((item) => `${item.provider}: ${item.model}`)
+        .join(" / "),
+      models: result.responses.map((item) => item.trace),
+      totalLatencyMs:
+        successfulTraces.length > 0
+          ? Math.max(
+              ...successfulTraces.map((item) => Number(item.totalLatencyMs || 0))
+            )
+          : undefined,
+      totalTokens: successfulTraces.reduce(
+        (sum, item) => sum + Number(item.totalTokens || 0),
+        0
+      ),
+      costEstimate: successfulTraces
+        .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
+        .toFixed(6),
       retrievalCount: result.retrievedChunks.length,
     };
 
-const responseBody = {
-  conversationId: conversation.id,
-  message: {
-    id: result.assistantMessage?.id ?? `assistant-${Date.now()}`,
-    role: "assistant",
-    content: result.answer,
-    created_at: new Date().toISOString(),
-  },
-  trace,
-};
+    const responseBody = {
+      conversationId: conversation.id,
 
-    logger.info("chat_request_success", {
-      user_id: userId,
-      conversation_id: conversation.id,
-      request_body: req.body,
-      response_body: responseBody,
-    });
+      // 기존 프론트 호환용: 첫 번째 응답을 message로 유지
+      message: firstResponse
+        ? {
+            id: firstResponse.id,
+            role: "assistant",
+            provider: firstResponse.provider,
+            model: firstResponse.model,
+            content: firstResponse.content,
+            created_at: firstResponse.created_at,
+          }
+        : null,
+
+      // 신규 프론트용: OpenAI / Azure AI 분기 응답
+      responses: result.responses,
+
+      trace,
+    };
+
+logApiInfo({
+  req,
+  event: "chat_request_success",
+  userId,
+  conversationId: conversation.id,
+  metadata: {
+    provider_count: result.responses.length,
+    retrieval_count: result.retrievedChunks.length,
+    total_tokens: trace.totalTokens,
+    total_latency_ms: trace.totalLatencyMs,
+    cost_estimate: trace.costEstimate,
+    success: true,
+  },
+});
 
     if (activeSpan) {
+      activeSpan.setTag("app.llm.model", trace.model || "unknown");
+      activeSpan.setTag("app.llm.provider_count", result.responses.length);
+      activeSpan.setTag("app.llm.total_tokens", trace.totalTokens);
+      activeSpan.setTag("app.llm.cost_estimate", trace.costEstimate);
+      activeSpan.setTag("app.retrieval.count", result.retrievedChunks.length);
+      activeSpan.setTag("app.rag.embedding_model", EMBEDDING_MODEL);
+      activeSpan.setTag("app.rag.chunk_size", RAG_CHUNK_SIZE);
+      activeSpan.setTag("app.rag.chunk_overlap", RAG_CHUNK_OVERLAP);
+      activeSpan.setTag("app.rag.top_k", RAG_TOP_K);
       setResponseBodyOnSpan(activeSpan, responseBody);
     }
 
     return res.json(responseBody);
-  } catch (error) {
-    logger.error("chat_request_failed", {
-      user_id: userId,
-      conversation_id: req.body?.conversationId || "new",
-      request_body: req.body,
-      error_message: error.message,
-      error_stack: error.stack,
+    } catch (error) {
+    logApiError({
+      req,
+      event: "chat_request_failed",
+      error,
+      userId,
+      conversationId: req.body?.conversationId || "new",
+      recoverable: false,
+      metadata: {
+        message_preview: String(req.body?.message ?? "").slice(0, 100),
+      },
     });
 
     if (requestSpan) {
@@ -1756,6 +2061,8 @@ logger.info("app_starting", {
   port,
   embedding_model: EMBEDDING_MODEL,
   openai_model: OPENAI_MODEL,
+  azure_openai_model: AZURE_OPENAI_MODEL,
+  azure_enabled: Boolean(azureClient),
   rag_chunk_size: RAG_CHUNK_SIZE,
   rag_chunk_overlap: RAG_CHUNK_OVERLAP,
   rag_top_k: RAG_TOP_K,
@@ -1764,10 +2071,21 @@ logger.info("app_starting", {
 try {
   await initDatabase();
 } catch (error) {
-  logger.error("db_init_failed", {
-    error_message: error.message,
-    error_stack: error.stack,
-  });
+logger.error("db_init_failed", {
+    event: "db_init_failed",
+    severity: "critical",
+    database: "mysql",
+    host: process.env.MYSQL_HOST,
+    database_name: process.env.MYSQL_DATABASE,
+    recoverable: false,
+    error: {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        stack: error.stack,
+    },
+});
+
   console.error("FATAL: failed to initialize database:", error.message);
   process.exit(1);
 }
@@ -1775,10 +2093,19 @@ try {
 try {
   await initRAG();
 } catch (error) {
-  logger.error("rag_init_failed", {
-    error_message: error.message,
-    error_stack: error.stack,
-  });
+logger.error("rag_init_failed", {
+    event: "rag_init_failed",
+    embedding_model: EMBEDDING_MODEL,
+    chunk_size: RAG_CHUNK_SIZE,
+    overlap: RAG_CHUNK_OVERLAP,
+    top_k: RAG_TOP_K,
+    recoverable: false,
+    error: {
+        message: error.message,
+        stack: error.stack,
+    },
+});
+
   console.error("FATAL: failed to initialize RAG index:", error.message);
   process.exit(1);
 }
@@ -1787,5 +2114,6 @@ app.listen(port, () => {
   logger.info("app_listening", {
     url: `http://localhost:${port}`,
   });
+
   console.log(`API listening on http://localhost:${port}`);
 });
