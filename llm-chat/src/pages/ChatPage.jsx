@@ -16,26 +16,53 @@ import remarkGfm from "remark-gfm";
 
 function ErrorStateCard({ errorState, onRetry, onDismiss }) {
   if (!errorState) return null;
+  const normalized =
+    typeof errorState === "string"
+      ? { title: "요청 실패", message: errorState, retryable: true }
+      : errorState;
 
   return (
-    <div style={styles.errorCard}>
+    <div role="alert" aria-live="assertive" style={styles.errorCard}>
       <div style={styles.errorCardTop}>
         <div style={styles.errorCardTitle}>
           <AlertTriangle size={16} />
-          <strong>요청 실패</strong>
+          <strong>{normalized.title || "요청 실패"}</strong>
         </div>
-        <button onClick={onDismiss} style={styles.errorInlineClose}>
+        <button
+          type="button"
+          aria-label="오류 메시지 닫기"
+          onClick={onDismiss}
+          style={styles.errorInlineClose}
+        >
           <X size={14} />
         </button>
       </div>
 
-      <div style={styles.errorCardBody}>{errorState}</div>
+      <div style={styles.errorCardBody}>{normalized.message}</div>
+      {normalized.hint ? (
+        <div style={styles.errorCardHint}>{normalized.hint}</div>
+      ) : null}
+      {normalized.requestId ? (
+        <div style={styles.errorRequestId}>
+          요청 ID: {normalized.requestId}
+        </div>
+      ) : null}
 
       <div style={styles.errorActions}>
-        <button onClick={onRetry} style={styles.errorPrimaryButton}>
-          다시 시도
-        </button>
-        <button onClick={onDismiss} style={styles.errorGhostButton}>
+        {normalized.retryable ? (
+          <button
+            type="button"
+            onClick={onRetry}
+            style={styles.errorPrimaryButton}
+          >
+            다시 시도
+          </button>
+        ) : null}
+        <button
+          type="button"
+          onClick={onDismiss}
+          style={styles.errorGhostButton}
+        >
           닫기
         </button>
       </div>
@@ -142,12 +169,17 @@ function ModelAnswerCard({ message, answerIndex = 0 }) {
     message.model && message.model !== "-" ? message.model : fallbackModel;
 
   const isAzure = String(provider).toLowerCase().includes("azure");
+  const isFailure =
+    message.status === "failed" ||
+    Boolean(message.error) ||
+    Boolean(message.trace?.error);
 
   return (
     <div
       style={{
         ...styles.compareCard,
         ...(isAzure ? styles.compareCardAzure : styles.compareCardOpenAI),
+        ...(isFailure ? styles.compareCardError : {}),
       }}
     >
       <div style={styles.modelHeader}>
@@ -171,14 +203,27 @@ function ModelAnswerCard({ message, answerIndex = 0 }) {
           style={{
             ...styles.providerBadge,
             ...(isAzure ? styles.providerBadgeAzure : styles.providerBadgeOpenAI),
+            ...(isFailure ? styles.providerBadgeError : {}),
           }}
         >
-          {isAzure ? "Azure" : "OpenAI"}
+          {isFailure ? "실패" : isAzure ? "Azure" : "OpenAI"}
         </span>
       </div>
 
       <div style={styles.answerScrollArea}>
-        <div style={styles.answerText}>
+        <div
+          role={isFailure ? "alert" : undefined}
+          style={{
+            ...styles.answerText,
+            ...(isFailure ? styles.answerError : {}),
+          }}
+        >
+          {isFailure ? (
+            <div style={styles.answerErrorTitle}>
+              <AlertTriangle size={15} />
+              {provider} 응답 실패
+            </div>
+          ) : null}
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
@@ -331,7 +376,16 @@ export default function ChatPage({
           placeholder="질문을 입력하세요"
           style={styles.chatInput}
         />
-        <button onClick={sendMessage} style={styles.sendButton}>
+        <button
+          type="button"
+          aria-label="메시지 보내기"
+          onClick={sendMessage}
+          disabled={loading || !input.trim()}
+          style={{
+            ...styles.sendButton,
+            ...(loading || !input.trim() ? styles.sendButtonDisabled : {}),
+          }}
+        >
           <Send size={16} />
         </button>
       </div>
@@ -370,12 +424,12 @@ const styles = {
   },
   modeCardDefaultActive: {
     background: "linear-gradient(135deg, #eff6ff, #dbeafe)",
-    borderColor: "#93c5fd",
+    border: "1px solid #93c5fd",
     boxShadow: "0 16px 32px rgba(37,99,235,0.10)",
   },
   modeCardDangerActive: {
     background: "linear-gradient(135deg, #fff1f2, #ffe4e6)",
-    borderColor: "#fda4af",
+    border: "1px solid #fda4af",
     boxShadow: "0 16px 32px rgba(225,29,72,0.10)",
   },
   modeIconWrap: {
@@ -483,6 +537,11 @@ compareCardOpenAI: {
 compareCardAzure: {
   borderTop: "3px solid #38bdf8",
 },
+compareCardError: {
+  border: "1px solid #fecdd3",
+  borderTop: "3px solid #e11d48",
+  background: "#fffafb",
+},
 
 modelTitleWrap: {
   flex: 1,
@@ -518,6 +577,11 @@ providerBadgeAzure: {
   color: "#0369a1",
   background: "#f0f9ff",
   borderColor: "#bae6fd",
+},
+providerBadgeError: {
+  color: "#be123c",
+  background: "#fff1f2",
+  border: "1px solid #fecdd3",
 },
 
 answerScrollArea: {
@@ -595,6 +659,17 @@ answerText: {
   wordBreak: "keep-all",
   textAlign: "left",
 },
+answerError: {
+  color: "#9f1239",
+},
+answerErrorTitle: {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  marginBottom: 10,
+  color: "#be123c",
+  fontWeight: 900,
+},
 
 answerTimestamp: {
   marginTop: 10,
@@ -651,6 +726,16 @@ answerTimestamp: {
   errorCardBody: {
     fontSize: 13,
     lineHeight: 1.7,
+  },
+  errorCardHint: {
+    color: "#9f1239",
+    fontSize: 11,
+    lineHeight: 1.5,
+  },
+  errorRequestId: {
+    color: "#9f1239",
+    fontSize: 10,
+    opacity: 0.76,
   },
   errorInlineClose: {
     width: 28,
@@ -713,6 +798,11 @@ answerTimestamp: {
     borderRadius: "50%",
     cursor: "pointer",
     boxShadow: "0 12px 24px rgba(15,23,42,0.18)",
+  },
+  sendButtonDisabled: {
+    cursor: "not-allowed",
+    opacity: 0.45,
+    boxShadow: "none",
   },
  mdH1: {
   fontSize: 18,

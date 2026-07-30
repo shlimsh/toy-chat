@@ -7,6 +7,7 @@ import {
   RefreshCw,
   Users,
 } from "lucide-react";
+import { requestJson, toUserError } from "../lib/api-client.js";
 
 const UI_FONT =
   'Inter, Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", "Segoe UI", Arial, sans-serif';
@@ -14,24 +15,20 @@ const UI_FONT =
 export default function MonitoringPage() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null);
 
   const loadSummary = async () => {
     setLoading(true);
     setError("");
 
     try {
-const response = await fetch("/api/monitoring/summary");
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result?.error || `HTTP ${response.status}`);
-      }
+      const result = await requestJson("/api/monitoring/summary", {
+        timeoutMs: 15000,
+      });
 
       setData(result);
     } catch (err) {
-      setError(err?.message || "Monitoring 데이터를 불러오지 못했습니다.");
+      setError(toUserError(err, "monitoring"));
     } finally {
       setLoading(false);
     }
@@ -89,13 +86,31 @@ const response = await fetch("/api/monitoring/summary");
           Organization : !DPN | MetanetX
         </div>
 
-        <button onClick={loadSummary} style={styles.refreshButton}>
+        <button
+          onClick={loadSummary}
+          disabled={loading}
+          aria-label="모니터링 데이터 새로고침"
+          style={{
+            ...styles.refreshButton,
+            ...(loading ? styles.refreshButtonDisabled : {}),
+          }}
+        >
           <RefreshCw size={14} />
-          새로고침
+          {loading ? "조회 중..." : "새로고침"}
         </button>
       </div>
 
-      {error ? <div style={styles.errorBox}>{error}</div> : null}
+      {error ? (
+        <div role="alert" aria-live="assertive" style={styles.errorBox}>
+          <strong>{error.title}</strong>
+          <span style={styles.errorMessage}>{error.message}</span>
+          {error.requestId ? (
+            <small style={styles.errorRequestId}>
+              요청 ID: {error.requestId}
+            </small>
+          ) : null}
+        </div>
+      ) : null}
 
       <div style={styles.cardGrid}>
         {cards.map((item) => (
@@ -205,6 +220,10 @@ const styles = {
     fontWeight: 800,
     boxShadow: "0 8px 18px rgba(15,23,42,0.04)",
   },
+  refreshButtonDisabled: {
+    opacity: 0.58,
+    cursor: "not-allowed",
+  },
   errorBox: {
     border: "1px solid #fecdd3",
     background: "#fff1f2",
@@ -214,6 +233,15 @@ const styles = {
     fontSize: 12,
     fontWeight: 700,
     flexShrink: 0,
+    display: "grid",
+    gap: 4,
+  },
+  errorMessage: {
+    lineHeight: 1.5,
+  },
+  errorRequestId: {
+    color: "#9f1239",
+    opacity: 0.78,
   },
   cardGrid: {
     display: "grid",

@@ -4,9 +4,13 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
+    "version:sync": "node scripts/sync-dd-version.mjs",
+    "predev": "npm run version:sync",
     "dev": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs",
-"test": "node --env-file=.env ./node_modules/mocha/bin/mocha.js \"tests/**/*.test.js\"",
-"test:dd": "node --env-file=.env -r dd-trace/ci/init ./node_modules/mocha/bin/mocha.js \"tests/**/*.test.js\""
+    "prestart": "npm run version:sync",
+    "start": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs",
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "check": "node --check index.mjs"
   },
   "dependencies": {
     "@datadog/datadog-api-client": "^1.58.0",

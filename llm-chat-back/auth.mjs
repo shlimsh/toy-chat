@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import { sendApiError } from "./app-errors.mjs";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
@@ -58,7 +59,7 @@ export function authRequired(req, res, next) {
     : null;
 
   if (!token) {
-    return res.status(401).json({ error: "unauthorized" });
+    return sendApiError(req, res, "auth_required");
   }
 
   try {
@@ -66,9 +67,6 @@ export function authRequired(req, res, next) {
     req.user = decoded;
     return next();
   } catch {
-    return res.status(401).json({
-      error: "invalid_token",
-      message: "인증 정보가 만료되었거나 유효하지 않습니다.",
-    });
+    return sendApiError(req, res, "invalid_token");
   }
 }

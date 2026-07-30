@@ -1,7 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { datadogRum } from "@datadog/browser-rum";
-import { datadogLogs } from "@datadog/browser-logs";
-import { Routes, Route, NavLink, useLocation } from "react-router-dom";
+import { NavLink } from "react-router-dom";
 import {
   LogOut,
   Sparkles,
@@ -18,12 +16,21 @@ import {
   PlusCircle,
 } from "lucide-react";
 
-import ChatPage from "./pages/ChatPage.jsx";
-import DashboardPage from "./pages/DashboardPage.jsx";
-import MonitoringPage from "./pages/MonitoringPage.jsx";
-import AnalyticsPage from "./pages/AnalyticsPage.jsx";
-import SettingsPage from "./pages/SettingsPage.jsx";
-import AboutPage from "./pages/AboutPage.jsx";
+import AppRoutes from "./components/AppRoutes.jsx";
+import AuthScreen from "./components/AuthScreen.jsx";
+import RumViewTracker from "./components/RumViewTracker.jsx";
+import { runtimeConfig } from "./config/runtime-config.js";
+import {
+  createUserError,
+  requestJson,
+  toUserError,
+} from "./lib/api-client.js";
+import {
+  datadogLogs,
+  datadogRum,
+  reportFrontendError,
+  reportFrontendWarning,
+} from "./lib/observability.js";
 
 const getWeatherIcon = (main = "") => {
   const value = String(main).toLowerCase();
@@ -41,10 +48,8 @@ const getWeatherIcon = (main = "") => {
   return "🌡️";
 };
 
-const LAMBDA_API_URL =
-  "https://zxezp1ixj5.execute-api.us-east-1.amazonaws.com/shlim/send";
-
-const API_BASE_URL = "";
+const LAMBDA_API_URL = runtimeConfig.lambdaApiUrl;
+const API_BASE_URL = runtimeConfig.apiBaseUrl;
 
 const TEST_MODES = {
   NORMAL: "normal",
@@ -452,9 +457,12 @@ style={{
               <button
                 key={conv.id}
                 onClick={() => onSelectConversation(conv.id)}
+                aria-pressed={String(conversationId) === String(conv.id)}
                 style={{
                   ...styles.historyItem,
-                  ...(conversationId === conv.id ? styles.historyItemActive : {}),
+                  ...(String(conversationId) === String(conv.id)
+                    ? styles.historyItemActive
+                    : {}),
                 }}
               >
                 {conv.title}
@@ -482,196 +490,6 @@ function PageButton({ to, label }) {
   );
 }
 
-function AuthScreen({ onLoginSuccess }) {
-  const [mode, setMode] = useState("login");
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setError("");
-
-    if (
-      !email.trim() ||
-      !password.trim() ||
-      (mode === "register" && !name.trim())
-    ) {
-      setError(
-        mode === "login"
-          ? "이메일과 비밀번호를 입력해 주세요."
-          : "이름, 이메일, 비밀번호를 모두 입력해 주세요."
-      );
-      return;
-    }
-
-    setLoading(true);
-
-    try {
-      const endpoint = mode === "login" ? "/auth/login" : "/auth/register";
-      const body =
-        mode === "login"
-          ? { email: email.trim(), password }
-          : { name: name.trim(), email: email.trim(), password };
-
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data?.message || data?.error || "요청 처리 중 오류가 발생했습니다."
-        );
-      }
-
-      localStorage.setItem("authToken", data.token);
-      localStorage.setItem("authUser", JSON.stringify(data.user));
-
-      datadogRum.setUser({
-        id: String(data.user.id),
-        email: data.user.email,
-        name: data.user.name,
-      });
-
-      datadogLogs.setUser({
-        id: String(data.user.id),
-        email: data.user.email,
-        name: data.user.name,
-      });
-
-      onLoginSuccess(data.user, data.token);
-    } catch (err) {
-      setError(err?.message ?? "로그인 처리 중 오류가 발생했습니다.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const switchMode = (nextMode) => {
-    setMode(nextMode);
-    setName("");
-    setEmail("");
-    setPassword("");
-    setError("");
-  };
-
-  const isSubmitDisabled =
-    loading ||
-    !email.trim() ||
-    !password.trim() ||
-    (mode === "register" && !name.trim());
-
-  return (
-    <div style={styles.authWrap}>
-      <div style={styles.authOuter}>
-        <div className="auth-card" style={styles.authCard}>
-          <div style={styles.authBrand}>toy-chat</div>
-
-          <div style={styles.authIntro}>
-            <div style={styles.authSubtitle}>
-              {mode === "login"
-                ? "계정 정보를 입력하여 서비스를 시작하세요."
-                : "새 계정을 만들고 바로 대화를 시작하세요."}
-            </div>
-          </div>
-
-          <form onSubmit={submit} style={styles.authForm}>
-            {mode === "register" && (
-              <input
-                type="text"
-                className="auth-input"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="이름"
-                autoComplete="name"
-                style={styles.authInput}
-              />
-            )}
-
-            <input
-              type="email"
-              className="auth-input"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="이메일"
-              autoComplete="email"
-              style={styles.authInput}
-            />
-
-            <input
-              type="password"
-              className="auth-input"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="비밀번호"
-              autoComplete={mode === "login" ? "current-password" : "new-password"}
-              style={styles.authInput}
-            />
-
-            {error ? (
-              <div className="auth-error" style={styles.authError}>
-                {error}
-              </div>
-            ) : null}
-
-            <button
-              type="submit"
-              className="auth-submit"
-              disabled={isSubmitDisabled}
-              style={{
-                ...styles.authSubmit,
-                ...(isSubmitDisabled ? styles.authSubmitDisabled : {}),
-              }}
-            >
-              {loading
-                ? "처리 중..."
-                : mode === "login"
-                ? "로그인"
-                : "회원가입"}
-            </button>
-          </form>
-
-          <div style={styles.authDivider}>
-            <span style={styles.authDividerLine} />
-            <span style={styles.authDividerText}>또는</span>
-            <span style={styles.authDividerLine} />
-          </div>
-
-          <button
-            type="button"
-            style={styles.authGhostButton}
-            onClick={() => switchMode(mode === "login" ? "register" : "login")}
-          >
-            {mode === "login"
-              ? "계정이 없으신가요? 회원가입"
-              : "이미 계정이 있으신가요? 로그인"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function RumViewTracker() {
-  const location = useLocation();
-
-  useEffect(() => {
-    datadogRum.startView({
-      name: location.pathname,
-    });
-  }, [location.pathname]);
-
-  return null;
-}
-
-
-
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem("authToken"));
   const [user, setUser] = useState(() => {
@@ -679,6 +497,7 @@ export default function App() {
     return raw ? JSON.parse(raw) : null;
   });
   const [authChecking, setAuthChecking] = useState(true);
+  const [authNotice, setAuthNotice] = useState("");
 
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
@@ -691,6 +510,7 @@ export default function App() {
   const [errorState, setErrorState] = useState(null);
   const [lastSubmittedMessage, setLastSubmittedMessage] = useState("");
   const [selectedMode, setSelectedMode] = useState(TEST_MODES.NORMAL);
+  const [frontendCrash, setFrontendCrash] = useState(false);
 
   const [modal, setModal] = useState({
     open: false,
@@ -703,7 +523,21 @@ export default function App() {
 
   const chatScrollRef = useRef(null);
   const inputRef = useRef(null);
-const skipNextConversationLoadRef = useRef(false);
+  const skipNextConversationLoadRef = useRef(false);
+  const sessionRequestRef = useRef(null);
+  const conversationListRequestRef = useRef(null);
+  const messageListRequestRef = useRef(null);
+  const chatRequestRef = useRef(null);
+
+  useEffect(
+    () => () => {
+      sessionRequestRef.current?.abort();
+      conversationListRequestRef.current?.abort();
+      messageListRequestRef.current?.abort();
+      chatRequestRef.current?.abort();
+    },
+    []
+  );
 
   const clearSession = () => {
     localStorage.removeItem("authToken");
@@ -724,26 +558,29 @@ const skipNextConversationLoadRef = useRef(false);
 
   useEffect(() => {
     const validateSession = async () => {
+      const controller = new AbortController();
+      sessionRequestRef.current = controller;
       const savedToken = localStorage.getItem("authToken");
       const savedUserRaw = localStorage.getItem("authUser");
 
       if (!savedToken || !savedUserRaw) {
         clearSession();
+        sessionRequestRef.current = null;
         setAuthChecking(false);
         return;
       }
 
       try {
-        const response = await fetch(`${API_BASE_URL}/auth/me`, {
+        const data = await requestJson(`${API_BASE_URL}/auth/me`, {
           headers: {
             Authorization: `Bearer ${savedToken}`,
           },
+          timeoutMs: 10000,
+          signal: controller.signal,
         });
 
-        const data = await response.json();
-
-        if (!response.ok || !data?.user) {
-          throw new Error(data?.error || "invalid session");
+        if (!data?.user) {
+          throw new Error("session user is missing");
         }
 
         setToken(savedToken);
@@ -761,10 +598,16 @@ const skipNextConversationLoadRef = useRef(false);
           email: data.user.email,
           name: data.user.name,
         });
-      } catch {
+      } catch (error) {
+        if (error?.code === "request_cancelled") return;
+        const userError = toUserError(error, "session");
+        setAuthNotice(userError.message);
         clearSession();
       } finally {
-        setAuthChecking(false);
+        if (sessionRequestRef.current === controller) {
+          sessionRequestRef.current = null;
+          setAuthChecking(false);
+        }
       }
     };
 
@@ -820,44 +663,54 @@ const skipNextConversationLoadRef = useRef(false);
 
   const loadConversations = async () => {
     if (!token) return;
+    conversationListRequestRef.current?.abort();
+    const controller = new AbortController();
+    conversationListRequestRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/conversations`, {
+      const data = await requestJson(`${API_BASE_URL}/conversations`, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
+        timeoutMs: 10000,
+        signal: controller.signal,
       });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "failed to load conversations");
-      }
 
       setConversations(data.conversations || []);
     } catch (error) {
-      console.error(error);
+      if (error?.code === "request_cancelled") return;
+      setErrorState({
+        ...toUserError(error, "conversations"),
+        retryAction: "load-conversations",
+      });
+      reportFrontendError(error, {
+        event: "frontend_api_failure",
+        feature: "conversations",
+      });
+    } finally {
+      if (conversationListRequestRef.current === controller) {
+        conversationListRequestRef.current = null;
+      }
     }
   };
 
   const loadMessages = async (targetConversationId) => {
     if (!targetConversationId || !token) return;
+    messageListRequestRef.current?.abort();
+    const controller = new AbortController();
+    messageListRequestRef.current = controller;
 
     try {
-      const response = await fetch(
+      const data = await requestJson(
         `${API_BASE_URL}/conversations/${targetConversationId}/messages`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
           },
+          timeoutMs: 10000,
+          signal: controller.signal,
         }
       );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "failed to load messages");
-      }
 
 const restored = (data.messages || [])
   .filter((msg) => msg.role === "user" || msg.role === "assistant")
@@ -865,8 +718,13 @@ const restored = (data.messages || [])
     id: msg.id || `${msg.role}-${index}`,
     role: msg.role,
     content: msg.content,
+    status:
+      msg.status ||
+      msg.metadata?.status ||
+      (msg.error || msg.metadata?.error ? "failed" : undefined),
     provider: msg.provider || msg.metadata?.provider || null,
     model: msg.model || msg.metadata?.model || null,
+    error: msg.error || null,
     trace: msg.trace || msg.metadata?.trace || null,
     rawCreatedAt: msg.created_at,
     timestamp: buildTimestampLabel(msg.created_at),
@@ -885,19 +743,28 @@ const latestAssistantTraces = restored
   .map((msg) => msg.trace);
 
 if (latestAssistantTraces.length > 0) {
+  const successfulTraces = latestAssistantTraces.filter(
+    (item) => !item.error
+  );
+
   setCurrentTrace({
     model: latestAssistantTraces
       .map((item) => `${item.provider}: ${item.model}`)
       .join(" / "),
     models: latestAssistantTraces,
-    totalLatencyMs: Math.max(
-      ...latestAssistantTraces.map((item) => Number(item.totalLatencyMs || 0))
-    ),
-    totalTokens: latestAssistantTraces.reduce(
+    totalLatencyMs:
+      successfulTraces.length > 0
+        ? Math.max(
+            ...successfulTraces.map((item) =>
+              Number(item.totalLatencyMs || 0)
+            )
+          )
+        : undefined,
+    totalTokens: successfulTraces.reduce(
       (sum, item) => sum + Number(item.totalTokens || 0),
       0
     ),
-    costEstimate: latestAssistantTraces
+    costEstimate: successfulTraces
       .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
       .toFixed(6),
   });
@@ -907,7 +774,20 @@ if (latestAssistantTraces.length > 0) {
 
 requestAnimationFrame(scrollToBottom);
     } catch (error) {
-      console.error(error);
+      if (error?.code === "request_cancelled") return;
+      setErrorState({
+        ...toUserError(error, "messages"),
+        retryAction: "load-messages",
+        retryPayload: targetConversationId,
+      });
+      reportFrontendError(error, {
+        event: "frontend_api_failure",
+        feature: "messages",
+      });
+    } finally {
+      if (messageListRequestRef.current === controller) {
+        messageListRequestRef.current = null;
+      }
     }
   };
 
@@ -939,6 +819,7 @@ useEffect(() => {
   }, [messages, loading]);
 
   const logout = () => {
+    setAuthNotice("");
     clearSession();
   };
 
@@ -953,6 +834,9 @@ useEffect(() => {
 
   const retryLastMessage = () => {
     if (!lastSubmittedMessage) return;
+    if (selectedMode !== TEST_MODES.NORMAL) {
+      setSelectedMode(TEST_MODES.NORMAL);
+    }
     setInput(lastSubmittedMessage);
     setErrorState(null);
     focusInput();
@@ -983,29 +867,24 @@ useEffect(() => {
 
   const triggerNetworkMode = async () => {
     try {
-      await fetch("http://127.0.0.1:3999/not-found", {
+      await requestJson("http://127.0.0.1:3999/not-found", {
         method: "POST",
+        timeoutMs: 3000,
       });
     } catch (error) {
-      const localTime = makeLocalTimestamp();
-
-      setErrorState(`네트워크 에러 발생: ${error.message}`);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `net-${Date.now()}`,
-          role: "assistant",
-          content: `에러 발생: ${error.message}`,
-          ...localTime,
-        },
-      ]);
+      setErrorState({
+        ...createUserError("network_unavailable", "network"),
+        retryAction: "chat",
+      });
+      reportFrontendError(error, {
+        event: "frontend_api_failure",
+        feature: "network_demo",
+      });
     }
   };
 
   const triggerFrontendMode = () => {
-    setTimeout(() => {
-      throw new Error("Intentional frontend error for demo");
-    }, 0);
+    setFrontendCrash(true);
   };
 
   const [nowDate, setNowDate] = useState("");
@@ -1107,7 +986,13 @@ const daily = (forecast.list || [])
 
       setForecastItems(daily);
     } catch (err) {
-      console.error(err);
+      reportFrontendWarning("날씨 정보를 불러오지 못했습니다.", {
+        event: "weather_request_failed",
+        error: {
+          kind: err?.name,
+          message: err?.message,
+        },
+      });
       setWeatherText("조회 실패");
       setWeatherMain("clear");
       setForecastItems([]);
@@ -1127,7 +1012,7 @@ const daily = (forecast.list || [])
   try {
     datadogRum.addAction("send_sms_to_manager_click");
 
-    const response = await fetch(LAMBDA_API_URL, {
+    await requestJson(LAMBDA_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1135,16 +1020,8 @@ const daily = (forecast.list || [])
       body: JSON.stringify({
         message: "담당자에게 문자 발송 요청",
       }),
+      timeoutMs: 15000,
     });
-
-    console.log("SMS response status:", response.status);
-
-    const data = await response.json();
-    console.log("SMS response body:", data);
-
-    if (!response.ok) {
-      throw new Error(data?.message || data?.error || `HTTP ${response.status}`);
-    }
 
     openModal(
       "문자 발송 완료",
@@ -1154,9 +1031,15 @@ const daily = (forecast.list || [])
       "default"
     );
   } catch (error) {
-    console.error("SMS failed:", error);
-    setErrorState(error.message);
-    datadogRum.addError(error);
+    if (error?.code === "request_cancelled") return;
+    setErrorState({
+      ...toUserError(error, "sms"),
+      retryAction: "send-sms",
+    });
+    reportFrontendError(error, {
+      event: "frontend_api_failure",
+      feature: "sms",
+    });
   }
 };
   const sendMessage = async () => {
@@ -1188,9 +1071,12 @@ const daily = (forecast.list || [])
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setLoading(true);
+    chatRequestRef.current?.abort();
+    const controller = new AbortController();
+    chatRequestRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/chat`, {
+      const data = await requestJson(`${API_BASE_URL}/chat`, {
         method: "POST",
         headers: authHeaders,
         body: JSON.stringify({
@@ -1198,20 +1084,9 @@ const daily = (forecast.list || [])
           message: trimmed,
           ...(selectedMode === TEST_MODES.BACKEND ? { forceError: true } : {}),
         }),
+        timeoutMs: 90000,
+        signal: controller.signal,
       });
-
-      const text = await response.text();
-
-      let data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        throw new Error(text || `HTTP ${response.status}`);
-      }
-
-      if (!response.ok) {
-        throw new Error(data?.error || `HTTP ${response.status}`);
-      }
 
 if (data?.conversationId) {
   if (!conversationId || data.conversationId !== conversationId) {
@@ -1228,9 +1103,14 @@ const assistantMessages = Array.isArray(data?.responses)
       return {
         id: item.id || `assistant-${Date.now()}-${index}`,
         role: "assistant",
+        status:
+          item.status ||
+          (item.error || item.trace?.error ? "failed" : "success"),
         provider: item.provider,
         model: item.model,
         content: item.content || "응답이 비어 있습니다.",
+        error: item.error || null,
+        persistence: item.persistence || null,
         trace: item.trace || null,
         rawCreatedAt: createdAt,
         timestamp: buildTimestampLabel(createdAt),
@@ -1243,7 +1123,11 @@ const assistantMessages = Array.isArray(data?.responses)
         provider: data?.message?.provider || "OpenAI",
         model: data?.message?.model || data?.trace?.model,
         content: data?.message?.content ?? "응답이 비어 있습니다.",
-        trace: data?.message?.trace || null,
+        trace:
+          data?.message?.trace ||
+          data?.trace?.models?.[0] ||
+          data?.trace ||
+          null,
         rawCreatedAt: data?.message?.created_at || new Date().toISOString(),
         timestamp: buildTimestampLabel(
           data?.message?.created_at || new Date().toISOString()
@@ -1251,30 +1135,92 @@ const assistantMessages = Array.isArray(data?.responses)
       },
     ];
 
+const successfulAssistantMessages = assistantMessages.filter(
+  (item) => item.status !== "failed" && !item.trace?.error
+);
+
+if (successfulAssistantMessages.length === 0) {
+  const error = new Error("The chat response contained no successful provider");
+  error.name = "ChatProviderResponseError";
+  error.code = "chat_unavailable";
+  error.requestId = data?.requestId || null;
+  error.retryable = true;
+  throw error;
+}
+
 setMessages((prev) => [...prev, ...assistantMessages]);
 
 setCurrentTrace(data.trace || null);
+
+if (data?.status === "partial_success") {
+  const failedProviders = data?.providerSummary?.failedProviders || [];
+  const successfulProviders =
+    data?.providerSummary?.successfulProviders || [];
+
+  datadogRum.addAction("chat_partial_success", {
+    request_id: data?.requestId,
+    successful_providers: successfulProviders,
+    failed_providers: failedProviders,
+    provider_success_count: data?.providerSummary?.successCount,
+    provider_failure_count: data?.providerSummary?.failureCount,
+  });
+
+  reportFrontendWarning("일부 AI 제공자의 답변 생성에 실패했습니다.", {
+    event: "chat_partial_success",
+    feature: "chat",
+    request_id: data?.requestId,
+    successful_providers: successfulProviders,
+    failed_providers: failedProviders,
+  });
+}
+
 loadConversations();
     } catch (error) {
-      const localTime = makeLocalTimestamp();
-
-      setErrorState(error.message);
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err-${Date.now()}`,
-          role: "assistant",
-          content: `에러 발생: ${error.message}`,
-          ...localTime,
-        },
-      ]);
+      if (error?.code === "request_cancelled") return;
+      setErrorState({
+        ...toUserError(error, "chat"),
+        retryAction: "chat",
+      });
+      reportFrontendError(error, {
+        event: "frontend_api_failure",
+        feature: "chat",
+      });
     } finally {
-      setLoading(false);
-      requestAnimationFrame(scrollToBottom);
-      focusInput();
+      if (chatRequestRef.current === controller) {
+        chatRequestRef.current = null;
+        setLoading(false);
+        requestAnimationFrame(scrollToBottom);
+        focusInput();
+      }
     }
   };
+
+  const retryFailedAction = () => {
+    const action = errorState?.retryAction;
+    const payload = errorState?.retryPayload;
+    setErrorState(null);
+
+    if (action === "load-conversations") {
+      loadConversations();
+      return;
+    }
+
+    if (action === "load-messages") {
+      loadMessages(payload);
+      return;
+    }
+
+    if (action === "send-sms") {
+      sendSmsToManager();
+      return;
+    }
+
+    retryLastMessage();
+  };
+
+  if (frontendCrash) {
+    throw new Error("Intentional frontend error for demo");
+  }
 
   if (authChecking) {
     return (
@@ -1302,12 +1248,15 @@ loadConversations();
       <>
         <GlobalStyle />
         <AuthScreen
-        onLoginSuccess={(nextUser, nextToken) => {
-          setUser(nextUser);
-          setToken(nextToken);
-          setAuthChecking(false);
-        }}
-      />
+          notice={authNotice}
+          styles={styles}
+          onLoginSuccess={(nextUser, nextToken) => {
+            setUser(nextUser);
+            setToken(nextToken);
+            setAuthNotice("");
+            setAuthChecking(false);
+          }}
+        />
       </>
     );
   }
@@ -1428,48 +1377,25 @@ loadConversations();
               </div>
             </div>
 
-            <Routes>
-              <Route
-                path="/"
-                element={
-                  <ChatPage
-                    TEST_MODES={TEST_MODES}
-                    selectedMode={selectedMode}
-                    setMode={setMode}
-                    messages={messages}
-                    loading={loading}
-                    errorState={errorState}
-                    retryLastMessage={retryLastMessage}
-                    setErrorState={setErrorState}
-                    input={input}
-                    setInput={setInput}
-                    sendMessage={sendMessage}
-                    chatScrollRef={chatScrollRef}
-                    inputRef={inputRef}
-                  />
-                }
-              />
-
-              <Route
-                path="/dashboard"
-                element={
-                  <DashboardPage
-                    conversations={conversations}
-                    currentTrace={currentTrace}
-                  />
-                }
-              />
-
-              <Route path="/monitoring" element={<MonitoringPage />} />
-
-              <Route
-                path="/analytics"
-                element={<AnalyticsPage conversations={conversations} />}
-              />
-
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/about" element={<AboutPage />} />
-            </Routes>
+            <AppRoutes
+              conversations={conversations}
+              currentTrace={currentTrace}
+              chatProps={{
+                TEST_MODES,
+                selectedMode,
+                setMode,
+                messages,
+                loading,
+                errorState,
+                retryLastMessage: retryFailedAction,
+                setErrorState,
+                input,
+                setInput,
+                sendMessage,
+                chatScrollRef,
+                inputRef,
+              }}
+            />
           </div>
 
 <TracePanel
@@ -1825,6 +1751,11 @@ historyItem: {
     border: "1px solid #fecdd3",
     fontSize: 13,
     lineHeight: 1.5,
+  },
+  authErrorHint: {
+    marginTop: 5,
+    fontSize: 11,
+    opacity: 0.82,
   },
   authSubmit: {
     height: 42,

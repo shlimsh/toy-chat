@@ -69,10 +69,14 @@ function safeLength(value) {
 function normalizeError(error) {
   if (!error) return undefined;
 
+  const kind = error.name || "Error";
+  const message = error.message || String(error);
+
   return {
-    name: error.name || "Error",
-    message: error.message || String(error),
-    stack: error.stack,
+    kind,
+    name: kind,
+    message,
+    stack: error.stack || `${kind}: ${message}`,
     code: error.code,
     status_code: error.status || error.statusCode,
   };
@@ -276,6 +280,26 @@ export function logLlmFailed({
   });
 }
 
+export function logPersistenceFailed({
+  userId,
+  conversationId,
+  requestId,
+  provider,
+  role,
+  error,
+}) {
+  logger.error("chat_message_persistence_failed", {
+    event: "chat_message_persistence_failed",
+    user_id: userId,
+    conversation_id: conversationId,
+    request_id: requestId,
+    provider,
+    message_role: role,
+    recoverable: true,
+    error: normalizeError(error),
+  });
+}
+
 export function logToolExecuted({
   userId,
   conversationId,
@@ -432,13 +456,7 @@ export function logApiError({
       ip: req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || req?.ip,
       user_agent: req?.headers?.["user-agent"],
     },
-    error: {
-      name: error?.name || "Error",
-      message: error?.message || String(error),
-      stack: error?.stack,
-      code: error?.code,
-      status_code: error?.status || error?.statusCode,
-    },
+    error: normalizeError(error),
     ...metadata,
   };
 
@@ -450,10 +468,12 @@ export function logApiError({
   const span = tracer.scope().active();
 
   if (span && error) {
-    span.setTag("error", true);
-    span.setTag("error.type", error?.name || "Error");
-    span.setTag("error.message", error?.message || String(error));
-    span.setTag("error.stack", error?.stack || "");
+    const normalized = normalizeError(error);
+    span.setTag("error", error);
+    span.setTag("error.type", normalized.kind);
+    span.setTag("error.msg", normalized.message);
+    span.setTag("error.message", normalized.message);
+    span.setTag("error.stack", normalized.stack);
     span.setTag("app.error.handled", true);
 
     if (event) {

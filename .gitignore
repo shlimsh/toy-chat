@@ -1,16 +1,11 @@
-# backend
-/llm-chat-back/node_modules/
-/llm-chat-back/.env
-/llm-chat-back/logs/
-#/llm-chat-back/data/   필요하면 추가
-
-# frontend
-/llm-chat/node_modules/
-
-# common build outputs
-/llm-chat/dist/
-/llm-chat-back/dist/
-/build/
-
-# log files
-*.log
+.dd-version-state.json
+.dd-version.lock
+**/.env
+**/.env.local
+**/.env.production
+**/.env.production.local
+**/node_modules/
+**/dist/
+**/coverage/
+**/logs/
+**/.sourcemap-test-*/

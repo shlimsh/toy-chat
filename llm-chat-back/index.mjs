@@ -1,8 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
 import OpenAI from "openai";
-import crypto from "crypto";
 import tracer from "dd-trace";
 import * as datadogApiClient from "@datadog/datadog-api-client";
 import logger, {
@@ -11,16 +9,12 @@ import logger, {
   logLlmCompleted,
   logLlmFailed,
   logApiError,
-  logApiWarn,
   logApiInfo,
+  logApiWarn,
+  logPersistenceFailed,
 } from "./logger.mjs";
-import { query, initDatabase } from "./db.mjs";
-import {
-  hashPassword,
-  comparePassword,
-  signToken,
-  authRequired,
-} from "./auth.mjs";
+import { closeDatabase, initDatabase } from "./db.mjs";
+import { authRequired } from "./auth.mjs";
 import {
   loadDocuments,
   buildChunkRecords,
@@ -30,66 +24,75 @@ import {
 } from "./rag.mjs";
 import { serializeTelemetry } from "./telemetry-sanitizer.mjs";
 import { buildProviderHistory } from "./conversation-history.mjs";
+import {
+  classifyServerError,
+  getErrorDefinition,
+  sendApiError,
+  toProviderUserError,
+} from "./app-errors.mjs";
+import { config, configWarnings } from "./config.mjs";
+import {
+  corsMiddleware,
+  createAvailabilityGate,
+  timingMiddleware,
+} from "./http-observability.mjs";
+import {
+  createShutdownController,
+  installProcessHandlers,
+} from "./lifecycle.mjs";
+import { withRequestTimeout } from "./request-timeout.mjs";
+import { createRuntimeState } from "./runtime-state.mjs";
+import { createAuthRouter } from "./routes/auth-routes.mjs";
+import { createConversationRouter } from "./routes/conversation-routes.mjs";
+import { createHealthRouter } from "./routes/health-routes.mjs";
+import { createMonitoringRouter } from "./routes/monitoring-routes.mjs";
+import {
+  createConversation,
+  createMessage,
+  getConversationByIdForUser,
+  getMessagesByConversationId,
+} from "./services/conversation-service.mjs";
+import {
+  markActiveSpanError,
+  markSpanError,
+  traceOperation,
+  traceProviderOperation,
+} from "./span-utils.mjs";
+import {
+  requireProviderSuccess,
+  selectCompatibilityResponse,
+} from "./provider-outcomes.mjs";
 
 const app = express();
 const llmobs = tracer.llmobs;
+const runtimeState = createRuntimeState();
 
-const ML_APP =
-  process.env.DD_LLMOBS_ML_APP || process.env.DD_SERVICE || "shlim-toy-chat";
-
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
-const AZURE_OPENAI_MODEL = process.env.AZURE_OPENAI_MODEL || "gpt-4o-mini";
-const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
-
-const EMBEDDING_MODEL =
-  process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
-
-const RAG_CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE || 1000);
-const RAG_CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP || 150);
-const RAG_TOP_K = Number(process.env.RAG_TOP_K || 3);
+const ML_APP = config.mlApp;
+const OPENAI_MODEL = config.openaiModel;
+const AZURE_OPENAI_MODEL = config.azureModel;
+const AZURE_OPENAI_ENDPOINT = config.azureEndpoint;
+const EMBEDDING_MODEL = config.embeddingModel;
+const RAG_CHUNK_SIZE = config.ragChunkSize;
+const RAG_CHUNK_OVERLAP = config.ragChunkOverlap;
+const RAG_TOP_K = config.ragTopK;
 
 const openaiClient = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: config.openaiApiKey,
 });
 
 const azureClient =
-  process.env.AZURE_OPENAI_API_KEY && AZURE_OPENAI_ENDPOINT
+  config.azureEnabled
     ? {
-        apiKey: process.env.AZURE_OPENAI_API_KEY,
+        apiKey: config.azureApiKey,
         endpoint: AZURE_OPENAI_ENDPOINT,
       }
     : null;
 
-const allowedOrigins = (process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
-
-if (allowedOrigins.length > 0) {
-  app.use(
-    cors({
-      origin(origin, cb) {
-        if (!origin) return cb(null, true);
-
-        if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
-          return cb(null, true);
-        }
-
-        return cb(new Error(`Origin ${origin} not allowed by CORS`));
-      },
-      credentials: true,
-    })
-  );
-}
-
-app.use((req, res, next) => {
-  res.setHeader("Timing-Allow-Origin", "*");
-  next();
-});
-
+app.use(corsMiddleware);
+app.use(timingMiddleware);
 app.use(express.json({ limit: "1mb" }));
-
 app.use(requestLogger);
+app.use(createAvailabilityGate(runtimeState));
 
 const ddConfig = datadogApiClient.client.createConfiguration({
   authMethods: {
@@ -99,40 +102,11 @@ const ddConfig = datadogApiClient.client.createConfiguration({
 });
 
 ddConfig.setServerVariables({
-  site: process.env.DD_SITE || "datadoghq.com",
+  site: config.ddSite,
 });
 
 const incidentsApi = new datadogApiClient.v2.IncidentsApi(ddConfig);
 const metricsApi = new datadogApiClient.v1.MetricsApi(ddConfig);
-
-process.on("uncaughtException", (error) => {
-  logger.error("uncaught_exception", {
-    event: "uncaught_exception",
-    severity: "critical",
-    process: process.pid,
-    node_version: process.version,
-    uptime_sec: Math.floor(process.uptime()),
-    memory: process.memoryUsage(),
-    error: {
-      name: error.name,
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
-    },
-  });
-});
-
-process.on("unhandledRejection", (reason) => {
-  logger.error("unhandled_rejection", {
-    reason:
-      reason instanceof Error ? reason.message : String(reason ?? "unknown"),
-    stack: reason instanceof Error ? reason.stack : undefined,
-  });
-});
-
-function generateId(prefix = "id") {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`.slice(0, 64);
-}
 
 function safeJsonParse(value, fallback = {}) {
   try {
@@ -142,7 +116,7 @@ function safeJsonParse(value, fallback = {}) {
   }
 }
 
-const SPAN_BODY_TAG_MAX = Number(process.env.SPAN_BODY_TAG_MAX || 8192);
+const SPAN_BODY_TAG_MAX = config.spanBodyTagMax;
 
 function truncateForSpan(str) {
   if (typeof str !== "string") return str;
@@ -168,19 +142,42 @@ function setResponseBodyOnSpan(span, body) {
   );
 }
 
-function markSpanError(error, extraTags = {}) {
-  const span = tracer.scope().active();
-  if (!span || !error) return;
+async function persistAssistantMessageSafely({
+  conversationId,
+  userId,
+  requestId,
+  provider,
+  content,
+  metadata,
+}) {
+  try {
+    const message = await createMessage({
+      conversationId,
+      role: "assistant",
+      content,
+      metadata,
+    });
 
-  span.setTag("error", true);
-  span.setTag("error.type", error.name || "Error");
-  span.setTag("error.message", error.message || "unknown error");
-  span.setTag("error.stack", error.stack || "");
+    return {
+      message,
+      status: "persisted",
+    };
+  } catch (error) {
+    // 이미 생성된 모델 답변은 사용자에게 반환한다. 저장 실패는 별도의
+    // DB span과 Error Tracking 로그로 남겨 후속 조치할 수 있게 한다.
+    logPersistenceFailed({
+      userId,
+      conversationId,
+      requestId,
+      provider,
+      role: "assistant",
+      error,
+    });
 
-  for (const [key, value] of Object.entries(extraTags)) {
-    if (value !== undefined && value !== null) {
-      span.setTag(key, value);
-    }
+    return {
+      message: null,
+      status: "failed",
+    };
   }
 }
 
@@ -218,190 +215,23 @@ app.use((req, res, next) => {
   next();
 });
 
-async function getUserByEmail(email) {
-  const rows = await query(
-    `
-    SELECT id, email, password_hash, name, created_at, updated_at
-    FROM users
-    WHERE email = ?
-    LIMIT 1
-    `,
-    [email]
-  );
-
-  return rows[0] || null;
-}
-
-async function getUserById(userId) {
-  const rows = await query(
-    `
-    SELECT id, email, name, created_at, updated_at
-    FROM users
-    WHERE id = ?
-    LIMIT 1
-    `,
-    [userId]
-  );
-
-  return rows[0] || null;
-}
-
-async function createUser({ name, email, passwordHash }) {
-  const result = await query(
-    `
-    INSERT INTO users (name, email, password_hash)
-    VALUES (?, ?, ?)
-    `,
-    [name, email, passwordHash]
-  );
-
-  return getUserById(result.insertId);
-}
-
-async function createConversation({ userId, title }) {
-  const id = generateId("conv");
-
-  await query(
-    `
-    INSERT INTO conversations (id, user_id, title)
-    VALUES (?, ?, ?)
-    `,
-    [id, userId, title]
-  );
-
-  const rows = await query(
-    `
-    SELECT id, user_id, title, created_at, updated_at
-    FROM conversations
-    WHERE id = ?
-    LIMIT 1
-    `,
-    [id]
-  );
-
-  return rows[0] || null;
-}
-
-async function getConversationByIdForUser(conversationId, userId) {
-  const rows = await query(
-    `
-    SELECT id, user_id, title, created_at, updated_at
-    FROM conversations
-    WHERE id = ? AND user_id = ?
-    LIMIT 1
-    `,
-    [conversationId, userId]
-  );
-
-  return rows[0] || null;
-}
-
-async function updateConversationTimestamp(conversationId) {
-  await query(
-    `
-    UPDATE conversations
-    SET updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-    `,
-    [conversationId]
-  );
-}
-
-async function createMessage({
-  conversationId,
-  role,
-  content,
-  metadata = null,
-}) {
-  const result = await query(
-    `
-    INSERT INTO messages (
-      conversation_id,
-      role,
-      content,
-      metadata_json
-    )
-    VALUES (?, ?, ?, ?)
-    `,
-    [
-      conversationId,
-      role,
-      content,
-      metadata ? JSON.stringify(metadata) : null,
-    ]
-  );
-
-  await updateConversationTimestamp(conversationId);
-
-  const rows = await query(
-    `
-    SELECT
-      id,
-      conversation_id,
-      role,
-      content,
-      metadata_json,
-      created_at
-    FROM messages
-    WHERE id = ?
-    LIMIT 1
-    `,
-    [result.insertId]
-  );
-
-  const row = rows[0] || null;
-  if (!row) return null;
-
-  return {
-    ...row,
-    metadata: row.metadata_json ? safeJsonParse(row.metadata_json, null) : null,
-  };
-}
-
-async function getMessagesByConversationId(conversationId) {
-  const rows = await query(
-    `
-    SELECT
-      id,
-      conversation_id,
-      role,
-      content,
-      metadata_json,
-      created_at
-    FROM messages
-    WHERE conversation_id = ?
-    ORDER BY created_at ASC, id ASC
-    `,
-    [conversationId]
-  );
-
-  return rows.map((row) => ({
-    ...row,
-    metadata: row.metadata_json ? safeJsonParse(row.metadata_json, null) : null,
-  }));
-}
-
-async function getConversationsByUserId(userId) {
-  return query(
-    `
-    SELECT id, user_id, title, created_at, updated_at
-    FROM conversations
-    WHERE user_id = ?
-    ORDER BY updated_at DESC, created_at DESC
-    `,
-    [userId]
-  );
-}
-
 const embedTextForIndexing = llmobs.wrap(
   { kind: "embedding", name: "embed_document_chunk" },
   async function embedTextForIndexing({ text, chunkId, docId }) {
     const safeText = String(text ?? "");
 
-    const response = await openaiClient.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: safeText,
-    });
+    const response = await withRequestTimeout(
+      "document embedding",
+      config.llmRequestTimeoutMs,
+      (signal) =>
+        openaiClient.embeddings.create(
+          {
+            model: EMBEDDING_MODEL,
+            input: safeText,
+          },
+          { signal }
+        )
+    );
 
     const embedding = response.data?.[0]?.embedding || [];
 
@@ -630,9 +460,12 @@ const queryDatadogTool = llmobs.wrap(
         message: "현재는 CPU 메트릭과 Incident 조회를 지원합니다.",
       };
     } catch (error) {
+      const datadogError = toProviderUserError("Datadog", error);
+
       return {
         source: "datadog",
-        error: error.message,
+        error: datadogError.message,
+        errorCode: datadogError.code,
       };
     }
   }
@@ -643,10 +476,18 @@ const embedUserQuery = llmobs.wrap(
   async function embedUserQuery(queryText) {
     const safeQuery = String(queryText ?? "");
 
-    const response = await openaiClient.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: safeQuery,
-    });
+    const response = await withRequestTimeout(
+      "query embedding",
+      config.llmRequestTimeoutMs,
+      (signal) =>
+        openaiClient.embeddings.create(
+          {
+            model: EMBEDDING_MODEL,
+            input: safeQuery,
+          },
+          { signal }
+        )
+    );
 
     const embedding = response.data?.[0]?.embedding || [];
 
@@ -786,26 +627,32 @@ async function runAzureFoundryModel({
 
   const startedAt = Date.now();
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "api-key": apiKey,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: "system",
-          content: buildSystemPrompt({ provider, model }),
+  const response = await withRequestTimeout(
+    `${provider} completion`,
+    config.llmRequestTimeoutMs,
+    (signal) =>
+      fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api-key": apiKey,
         },
-        ...baseMessages,
-        ...(docsContext
-          ? [{ role: "system", content: docsContext }]
-          : []),
-      ],
-    }),
-  });
+        signal,
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: buildSystemPrompt({ provider, model }),
+            },
+            ...baseMessages,
+            ...(docsContext
+              ? [{ role: "system", content: docsContext }]
+              : []),
+          ],
+        }),
+      })
+  );
 
   const text = await response.text();
   let data = null;
@@ -926,19 +773,27 @@ async function runModelWithTools({
 
   const firstStartedAt = Date.now();
 
-  const firstCompletion = await client.chat.completions.create({
-    model,
-    messages: [
-      {
-        role: "system",
-        content: buildSystemPrompt({ provider, model }),
-      },
-      ...baseMessages,
-      ...(docsContext ? [{ role: "system", content: docsContext }] : []),
-    ],
-    tools: buildToolDefinitions(),
-    tool_choice: "auto",
-  });
+  const firstCompletion = await withRequestTimeout(
+    `${provider} first completion`,
+    config.llmRequestTimeoutMs,
+    (signal) =>
+      client.chat.completions.create(
+        {
+          model,
+          messages: [
+            {
+              role: "system",
+              content: buildSystemPrompt({ provider, model }),
+            },
+            ...baseMessages,
+            ...(docsContext ? [{ role: "system", content: docsContext }] : []),
+          ],
+          tools: buildToolDefinitions(),
+          tool_choice: "auto",
+        },
+        { signal }
+      )
+  );
 
   const firstLatencyMs = Date.now() - firstStartedAt;
   const firstMessage = firstCompletion.choices?.[0]?.message;
@@ -987,10 +842,18 @@ async function runModelWithTools({
 
     const secondStartedAt = Date.now();
 
-    const secondCompletion = await client.chat.completions.create({
-      model,
-      messages: secondMessages,
-    });
+    const secondCompletion = await withRequestTimeout(
+      `${provider} tool completion`,
+      config.llmRequestTimeoutMs,
+      (signal) =>
+        client.chat.completions.create(
+          {
+            model,
+            messages: secondMessages,
+          },
+          { signal }
+        )
+    );
 
     finalLatencyMs = firstLatencyMs + (Date.now() - secondStartedAt);
     finalModel = secondCompletion.model || model;
@@ -1019,563 +882,13 @@ async function runModelWithTools({
   };
 }
 
-app.get("/health", (_req, res) => {
-  return res.json({
-    ok: true,
-    service: process.env.DD_SERVICE || "shlim-toy-chat-api",
-    openaiModel: OPENAI_MODEL,
-    azureOpenAIModel: AZURE_OPENAI_MODEL,
-    azureEnabled: Boolean(azureClient),
-  });
-});
-
+app.use("/health", createHealthRouter(runtimeState));
+app.use("/auth", createAuthRouter());
+app.use("/conversations", createConversationRouter());
 app.get("/monitoring/test", (_req, res) => {
-  return res.json({
-    ok: true,
-    message: "monitoring route alive",
-  });
+  res.json({ ok: true, message: "monitoring route alive" });
 });
-
-function monitoringGetTodayRangeSecKST() {
-  const now = new Date();
-
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(now);
-
-  const y = parts.find((p) => p.type === "year")?.value;
-  const m = parts.find((p) => p.type === "month")?.value;
-  const d = parts.find((p) => p.type === "day")?.value;
-
-  const from = new Date(`${y}-${m}-${d}T00:00:00+09:00`);
-
-  return {
-    fromSec: Math.floor(from.getTime() / 1000),
-    toSec: Math.floor(now.getTime() / 1000),
-  };
-}
-
-function monitoringGetHostFromScope(scope = "") {
-  const match = String(scope).match(/host:([^,\s]+)/);
-  return match?.[1] || "unknown";
-}
-
-function monitoringGetResourceFromScope(scope = "") {
-  const match =
-    String(scope).match(/resource_name:([^,\s]+)/) ||
-    String(scope).match(/resource:([^,\s]+)/);
-
-  return match?.[1] || "unknown";
-}
-
-function monitoringGetUserFromScope(scope = "") {
-  const match =
-    String(scope).match(/usr\.name:([^,\s]+)/) ||
-    String(scope).match(/usr_name:([^,\s]+)/) ||
-    String(scope).match(/user\.name:([^,\s]+)/) ||
-    String(scope).match(/name:([^,\s]+)/);
-
-  return match?.[1] || "unknown";
-}
-
-function monitoringGetSeriesValues(pointlist = []) {
-  return pointlist
-    .map((point) => point?.[1])
-    .filter((value) => typeof value === "number" && Number.isFinite(value));
-}
-
-function monitoringAverage(values = []) {
-  if (!values.length) return null;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function monitoringTotal(values = []) {
-  return values.reduce((sum, value) => sum + value, 0);
-}
-
-function monitoringGetAllValues(result) {
-  return (result.series || []).flatMap((item) =>
-    monitoringGetSeriesValues(item.pointlist || [])
-  );
-}
-
-function monitoringFormatPercent(value) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return `${Number(value).toFixed(1)}%`;
-}
-
-function monitoringFormatLatency(value) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-
-  const num = Number(value);
-
-  if (num < 1) {
-    return `${(num * 1000).toFixed(0)} ms`;
-  }
-
-  return `${num.toFixed(2)} s`;
-}
-
-function monitoringFormatSessions(value) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  const count = Math.round(Number(value));
-  return count === 1 ? "1 session" : `${count} sessions`;
-}
-
-function monitoringGetTopCpuHosts(result, limit = 3) {
-  return (result.series || [])
-    .map((item) => {
-      const idleAvg = monitoringAverage(
-        monitoringGetSeriesValues(item.pointlist || [])
-      );
-
-      const idlePercent =
-        idleAvg === null ? null : idleAvg <= 1 ? idleAvg * 100 : idleAvg;
-
-      const usage = idlePercent === null ? null : 100 - idlePercent;
-
-      return {
-        host: monitoringGetHostFromScope(item.scope),
-        value: usage,
-        displayValue: monitoringFormatPercent(usage),
-      };
-    })
-    .filter((item) => item.value !== null)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-function monitoringGetTopMemoryHosts(result, limit = 3) {
-  return (result.series || [])
-    .map((item) => {
-      const usableAvgRaw = monitoringAverage(
-        monitoringGetSeriesValues(item.pointlist || [])
-      );
-
-      const usableAvg =
-        usableAvgRaw === null
-          ? null
-          : usableAvgRaw <= 1
-          ? usableAvgRaw * 100
-          : usableAvgRaw;
-
-      const usage = usableAvg === null ? null : 100 - usableAvg;
-
-      return {
-        host: monitoringGetHostFromScope(item.scope),
-        value: usage,
-        displayValue: monitoringFormatPercent(usage),
-      };
-    })
-    .filter((item) => item.value !== null)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-function monitoringGetTopLatencyResources(result, limit = 3) {
-  return (result.series || [])
-    .map((item) => {
-      const latencyAvg = monitoringAverage(
-        monitoringGetSeriesValues(item.pointlist || [])
-      );
-
-      return {
-        resource: monitoringGetResourceFromScope(item.scope),
-        value: latencyAvg,
-        displayValue: monitoringFormatLatency(latencyAvg),
-      };
-    })
-    .filter((item) => item.value !== null)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-function monitoringGetTopVisitorUsers(result, limit = 3) {
-  return (result.series || [])
-    .map((item) => {
-      const total = monitoringTotal(
-        monitoringGetSeriesValues(item.pointlist || [])
-      );
-
-      return {
-        username: monitoringGetUserFromScope(item.scope),
-        value: total,
-        displayValue: monitoringFormatSessions(total),
-      };
-    })
-    .filter((item) => item.value > 0)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-app.get("/api/monitoring/summary", async (req, res) => {
-  try {
-    const { fromSec, toSec } = monitoringGetTodayRangeSecKST();
-
-    const [cpuIdleResult, memoryUsableResult, latencyResult, visitorsResult] =
-      await Promise.all([
-        metricsApi.queryMetrics({
-          from: fromSec,
-          to: toSec,
-          query: "avg:system.cpu.idle{*} by {host}",
-        }),
-        metricsApi.queryMetrics({
-          from: fromSec,
-          to: toSec,
-          query: "avg:system.mem.pct_usable{*} by {host}",
-        }),
-        metricsApi.queryMetrics({
-          from: fromSec,
-          to: toSec,
-          query:
-            "avg:trace.express.request{env:dev,service:shlim-toy-chat-api} by {resource_name}",
-        }),
-        metricsApi.queryMetrics({
-          from: fromSec,
-          to: toSec,
-          query: "sum:custom.user{*} by {usr.name}.as_count()",
-        }),
-      ]);
-
-    const topCpuHosts = monitoringGetTopCpuHosts(cpuIdleResult, 3);
-    const topMemoryHosts = monitoringGetTopMemoryHosts(memoryUsableResult, 3);
-    const topLatencyResources = monitoringGetTopLatencyResources(
-      latencyResult,
-      3
-    );
-    const topVisitorUsers = monitoringGetTopVisitorUsers(visitorsResult, 3);
-    const visitorsTotal = monitoringTotal(monitoringGetAllValues(visitorsResult));
-
-    return res.json({
-      range: {
-        timezone: "Asia/Seoul",
-        from: fromSec,
-        to: toSec,
-      },
-      metrics: {
-        cpu: topCpuHosts[0]?.displayValue || "-",
-        memory: topMemoryHosts[0]?.displayValue || "-",
-        latency: topLatencyResources[0]?.displayValue || "-",
-        visitors: `${Math.round(visitorsTotal)} sessions`,
-      },
-      details: {
-        cpuHosts: topCpuHosts,
-        memoryHosts: topMemoryHosts,
-        latencyResources: topLatencyResources,
-        visitorsUsers: topVisitorUsers,
-      },
-    });
-  } catch (error) {
-    logApiError({
-      req,
-      event: "monitoring_summary_failed",
-      error,
-      recoverable: true,
-      metadata: {
-        datadog_site: process.env.DD_SITE,
-      },
-    });
-
-    return res.status(500).json({
-      error: "monitoring_summary_failed",
-      message: error?.message || "failed to load monitoring summary",
-    });
-  }
-});
-
-app.post("/auth/register", async (req, res) => {
-  try {
-    const { name, email, password } = req.body ?? {};
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name is required" });
-    }
-
-    if (!email || !String(email).trim()) {
-      return res.status(400).json({ error: "email is required" });
-    }
-
-    if (!password || !String(password).trim()) {
-      return res.status(400).json({ error: "password is required" });
-    }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const existingUser = await getUserByEmail(normalizedEmail);
-
-    if (existingUser) {
-      return res.status(409).json({ error: "email already exists" });
-    }
-
-    const passwordHash = await hashPassword(String(password));
-
-    const user = await createUser({
-      name: String(name).trim(),
-      email: normalizedEmail,
-      passwordHash,
-    });
-
-    const token = signToken(user);
-
-logApiInfo({
-  req,
-  event: "auth_register_success",
-  userId: user.id,
-  metadata: {
-    email: user.email,
-  },
-});
-
-    return res.json({
-      token,
-      user,
-    });
-  } catch (error) {
-logApiError({
-    req,
-    event: "auth_register_failed",
-    error,
-    recoverable:false,
-    metadata:{
-        email:req.body?.email
-    }
-});
-
-    markSpanError(error, {
-      "app.feature": "auth",
-      "app.route": "POST /auth/register",
-    });
-
-    return res.status(500).json({
-      error: error?.message || "internal server error",
-    });
-  }
-});
-
-app.post("/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body ?? {};
-
-    if (!email || !String(email).trim()) {
-      return res.status(400).json({
-        error: "email_required",
-        message: "이메일을 입력해주세요.",
-      });
-    }
-
-    if (!password || !String(password).trim()) {
-      return res.status(400).json({
-        error: "password_required",
-        message: "비밀번호를 입력해주세요.",
-      });
-    }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const user = await getUserByEmail(normalizedEmail);
-
-    if (!user) {
-      logApiWarn({
-        req,
-        event: "auth_login_failed",
-        reason: "user_not_found",
-        recoverable: true,
-        metadata: {
-          email: normalizedEmail,
-        },
-      });
-
-      return res.status(404).json({
-        error: "user_not_found",
-        message: "존재하지 않는 이메일입니다.",
-      });
-    }
-
-    const matched = await comparePassword(String(password), user.password_hash);
-
-    if (!matched) {
-      logApiWarn({
-        req,
-        event: "auth_login_failed",
-        reason: "invalid_password",
-        recoverable: true,
-        metadata: {
-          email: normalizedEmail,
-          user_id: user.id,
-        },
-      });
-
-      return res.status(401).json({
-        error: "invalid_password",
-        message: "비밀번호가 올바르지 않습니다.",
-      });
-    }
-
-    const safeUser = {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      created_at: user.created_at,
-      updated_at: user.updated_at,
-    };
-
-    const token = signToken(safeUser);
-
-logApiInfo({
-  req,
-  event: "auth_login_success",
-  userId: safeUser.id,
-  metadata: {
-    email: safeUser.email,
-  },
-});
-
-    return res.json({
-      token,
-      user: safeUser,
-    });
-  } catch (error) {
-    logApiError({
-      req,
-      event: "auth_login_failed",
-      error,
-      recoverable: false,
-      metadata: {
-        email: req.body?.email,
-      },
-    });
-
-    markSpanError(error, {
-      "app.feature": "auth",
-      "app.route": "POST /auth/login",
-    });
-
-    return res.status(500).json({
-      error: "internal_server_error",
-      message: error?.message || "internal server error",
-    });
-  }
-});
-
-app.get("/auth/me", authRequired, async (req, res) => {
-  try {
-    const user = await getUserById(req.user.userId);
-
-    if (!user) {
-      return res.status(401).json({ error: "invalid token" });
-    }
-
-    return res.json({ user });
-  } catch (error) {
-logApiError({
-    req,
-    event:"auth_me_failed",
-    error,
-    userId:req.user?.userId,
-    recoverable:false
-});
-
-    markSpanError(error, {
-      "app.feature": "auth",
-      "app.route": "GET /auth/me",
-      "app.user_id": req.user?.userId,
-    });
-
-    return res.status(500).json({
-      error: error?.message || "internal server error",
-    });
-  }
-});
-
-app.get("/conversations", authRequired, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const conversations = await getConversationsByUserId(userId);
-
-    logger.info("conversations_request_success", {
-      user_id: userId,
-      conversation_count: conversations.length,
-    });
-
-    return res.json({ conversations });
-  } catch (error) {
-logApiError({
-    req,
-    event:"conversations_failed",
-    error,
-    userId:req.user?.userId,
-    recoverable:false
-});
-
-    markSpanError(error, {
-      "app.feature": "conversations",
-      "app.route": "GET /conversations",
-      "app.user_id": req.user?.userId,
-    });
-
-    return res.status(500).json({
-      error: error?.message || "internal server error",
-    });
-  }
-});
-
-app.get(
-  "/conversations/:conversationId/messages",
-  authRequired,
-  async (req, res) => {
-    try {
-      const { conversationId } = req.params;
-      const userId = req.user.userId;
-
-      const conversation = await getConversationByIdForUser(
-        conversationId,
-        userId
-      );
-
-      if (!conversation) {
-        return res.status(404).json({ error: "conversation not found" });
-      }
-
-      const messages = await getMessagesByConversationId(conversationId);
-
-      const normalizedMessages = messages.map((msg) => ({
-        ...msg,
-        provider: msg.metadata?.provider || null,
-        model: msg.metadata?.model || null,
-        trace: msg.metadata?.trace || null,
-      }));
-
-      logger.info("conversation_messages_request_success", {
-        user_id: userId,
-        conversation_id: conversationId,
-        message_count: messages.length,
-      });
-
-      return res.json({ messages: normalizedMessages });
-    } catch (error) {
-logApiError({
-    req,
-    event:"conversation_messages_failed",
-    error,
-    userId:req.user?.userId,
-    conversationId:req.params.conversationId,
-    recoverable:false
-});
-
-      markSpanError(error, {
-        "app.feature": "conversation_messages",
-        "app.route": "GET /conversations/:conversationId/messages",
-        "app.user_id": req.user?.userId,
-        "app.conversation_id": req.params?.conversationId,
-      });
-
-      return res.status(500).json({
-        error: error?.message || "internal server error",
-      });
-    }
-  }
-);
+app.use("/api/monitoring", createMonitoringRouter({ metricsApi }));
 
 app.post("/chat", authRequired, async (req, res) => {
   const requestSpan = tracer.scope().active();
@@ -1585,6 +898,8 @@ app.post("/chat", authRequired, async (req, res) => {
   try {
     if (forceError === true) {
       const error = new Error("Intentional backend error for demo");
+      error.name = "ForcedDemoError";
+      error.code = "FORCED_DEMO_ERROR";
 
       logApiError({
         req,
@@ -1599,14 +914,17 @@ app.post("/chat", authRequired, async (req, res) => {
         },
       });
 
-      return res.status(500).json({
-        error: "forced_demo_error",
-        message: error.message,
+      markSpanError(requestSpan, error, {
+        "app.error.code": "forced_demo_error",
+        "app.error.handled": true,
+        "http.status_code": 500,
       });
+
+      return sendApiError(req, res, "forced_demo_error");
     }
 
     if (!message || !String(message).trim()) {
-      return res.status(400).json({ error: "message is required" });
+      return sendApiError(req, res, "message_required");
     }
 
 logChatRequest({
@@ -1713,24 +1031,56 @@ logApiInfo({
             let retrievedChunks = [];
 
             if (intent.needDocs) {
-              const queryEmbedding = await embedUserQuery(String(message));
+              try {
+                retrievedChunks = await traceOperation(
+                  {
+                    name: "chat.rag.retrieval",
+                    resource: EMBEDDING_MODEL,
+                    tags: {
+                      component: "toy-chat",
+                      "span.kind": "client",
+                      "llm.provider": "OpenAI Embeddings",
+                      "llm.model": EMBEDDING_MODEL,
+                      "app.request_id": req.requestId,
+                      "app.conversation_id": conversation.id,
+                    },
+                  },
+                  async () => {
+                    const queryEmbedding = await embedUserQuery(String(message));
+                    return retrieveRelevantChunks({
+                      query: String(message),
+                      queryEmbedding,
+                      topK: RAG_TOP_K,
+                    });
+                  }
+                );
 
-              retrievedChunks = retrieveRelevantChunks({
-                query: String(message),
-                queryEmbedding,
-                topK: RAG_TOP_K,
-              });
-
-              logger.info("chat_retrieval_completed", {
-                user_id: userId,
-                conversation_id: conversation.id,
-                retrieval_count: retrievedChunks.length,
-                retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
-                retrieval_scores: retrievedChunks.map((chunk) =>
-                  Number(chunk.score.toFixed(6))
-                ),
-                embedding_model: EMBEDDING_MODEL,
-              });
+                logger.info("chat_retrieval_completed", {
+                  event: "chat_retrieval_completed",
+                  request_id: req.requestId,
+                  user_id: userId,
+                  conversation_id: conversation.id,
+                  retrieval_count: retrievedChunks.length,
+                  retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
+                  retrieval_scores: retrievedChunks.map((chunk) =>
+                    Number(chunk.score.toFixed(6))
+                  ),
+                  embedding_model: EMBEDDING_MODEL,
+                });
+              } catch (error) {
+                // RAG 보강 실패가 Azure/OpenAI의 일반 답변까지 막지 않도록
+                // 빈 Context로 계속 진행하되, 실패한 child span과 error log는 남긴다.
+                retrievedChunks = [];
+                logLlmFailed({
+                  userId,
+                  conversationId: conversation.id,
+                  requestId: req.requestId,
+                  provider: "OpenAI Embeddings",
+                  model: EMBEDDING_MODEL,
+                  stage: "chat_rag_retrieval",
+                  error,
+                });
+              }
             }
 
             const docsContext =
@@ -1749,26 +1099,46 @@ logApiInfo({
 const modelJobs = [
   {
     provider: "OpenAI",
+    model: OPENAI_MODEL,
     runner: () =>
-      runModelWithTools({
-        provider: "OpenAI",
-        client: openaiClient,
-        model: OPENAI_MODEL,
-        baseMessages: buildProviderHistory(history, "OpenAI"),
-        docsContext,
-        conversationId: conversation.id,
-        userId,
-      }),
+      traceProviderOperation(
+        {
+          provider: "OpenAI",
+          model: OPENAI_MODEL,
+          requestId: req.requestId,
+          conversationId: conversation.id,
+        },
+        () =>
+          runModelWithTools({
+            provider: "OpenAI",
+            client: openaiClient,
+            model: OPENAI_MODEL,
+            baseMessages: buildProviderHistory(history, "OpenAI"),
+            docsContext,
+            conversationId: conversation.id,
+            userId,
+          })
+      ),
   },
   {
     provider: "Azure AI",
+    model: AZURE_OPENAI_MODEL,
     runner: () =>
-      runAzureFoundryModel({
-        provider: "Azure AI",
-        model: AZURE_OPENAI_MODEL,
-        baseMessages: buildProviderHistory(history, "Azure AI"),
-        docsContext,
-      }),
+      traceProviderOperation(
+        {
+          provider: "Azure AI",
+          model: AZURE_OPENAI_MODEL,
+          requestId: req.requestId,
+          conversationId: conversation.id,
+        },
+        () =>
+          runAzureFoundryModel({
+            provider: "Azure AI",
+            model: AZURE_OPENAI_MODEL,
+            baseMessages: buildProviderHistory(history, "Azure AI"),
+            docsContext,
+          })
+      ),
   },
 ];
 
@@ -1796,11 +1166,14 @@ const settled = await Promise.allSettled(
                   retrievalCount: retrievedChunks.length,
                 };
 
-                const assistantMessage = await createMessage({
+                const persistence = await persistAssistantMessageSafely({
                   conversationId: conversation.id,
-                  role: "assistant",
+                  userId,
+                  requestId: req.requestId,
+                  provider: value.provider,
                   content: value.content,
                   metadata: {
+                    status: "success",
                     provider: value.provider,
                     model: value.model,
                     input_tokens: value.promptTokens,
@@ -1817,15 +1190,22 @@ const settled = await Promise.allSettled(
                     trace: responseTrace,
                   },
                 });
+                responseTrace.persistenceStatus = persistence.status;
 
                 responses.push({
-                  id: assistantMessage?.id ?? `assistant-${Date.now()}-${index}`,
+                  id:
+                    persistence.message?.id ??
+                    `assistant-${Date.now()}-${index}`,
                   role: "assistant",
+                  status: "success",
                   provider: value.provider,
                   model: value.model,
                   content: value.content,
                   created_at:
-                    assistantMessage?.created_at || new Date().toISOString(),
+                    persistence.message?.created_at || new Date().toISOString(),
+                  persistence: {
+                    status: persistence.status,
+                  },
                   trace: responseTrace,
                 });
 
@@ -1844,40 +1224,58 @@ logLlmCompleted({
   retrievalCount: retrievedChunks.length,
 });
               } else {
-                const errorMessage =
-                  item.reason?.message || `${job.provider} request failed`;
-                const failedModel =
-                  job.provider === "Azure AI"
-                    ? AZURE_OPENAI_MODEL
-                    : OPENAI_MODEL;
+                const providerError = toProviderUserError(
+                  job.provider,
+                  item.reason
+                );
+                const failedModel = job.model;
                 const responseTrace = {
                   provider: job.provider,
                   model: failedModel,
-                  error: errorMessage,
+                  error: providerError.message,
+                  errorCode: providerError.code,
+                  retryable: providerError.retryable,
                 };
 
-                const assistantMessage = await createMessage({
+                const persistence = await persistAssistantMessageSafely({
                   conversationId: conversation.id,
-                  role: "assistant",
-                  content: `에러 발생: ${errorMessage}`,
+                  userId,
+                  requestId: req.requestId,
+                  provider: job.provider,
+                  content: providerError.message,
                   metadata: {
+                    status: "failed",
                     provider: job.provider,
                     model: failedModel,
-                    error: errorMessage,
+                    error: providerError.message,
+                    error_code: providerError.code,
+                    retryable: providerError.retryable,
                     user_id: userId,
                     request_id: req.requestId,
                     trace: responseTrace,
                   },
                 });
+                responseTrace.persistenceStatus = persistence.status;
 
                 responses.push({
-                  id: assistantMessage?.id ?? `assistant-error-${Date.now()}`,
+                  id:
+                    persistence.message?.id ??
+                    `assistant-error-${Date.now()}-${index}`,
                   role: "assistant",
+                  status: "failed",
                   provider: job.provider,
                   model: failedModel,
-                  content: `에러 발생: ${errorMessage}`,
+                  content: providerError.message,
                   created_at:
-                    assistantMessage?.created_at || new Date().toISOString(),
+                    persistence.message?.created_at || new Date().toISOString(),
+                  error: {
+                    code: providerError.code,
+                    message: providerError.message,
+                    retryable: providerError.retryable,
+                  },
+                  persistence: {
+                    status: persistence.status,
+                  },
                   trace: responseTrace,
                 });
 
@@ -1893,6 +1291,7 @@ logLlmFailed({
               }
             }
 
+            const providerSummary = requireProviderSuccess(responses);
             const outputText = responses
               .map(
                 (item) =>
@@ -1911,6 +1310,7 @@ logLlmFailed({
             return {
               responses,
               retrievedChunks,
+              providerSummary,
             };
           }
         );
@@ -1927,10 +1327,11 @@ logLlmFailed({
     );
 
     const successfulTraces = result.responses
-      .map((item) => item.trace)
-      .filter((trace) => !trace.error);
+      .filter((item) => item.status === "success")
+      .map((item) => item.trace);
 
-    const firstResponse = result.responses[0];
+    const firstResponse = selectCompatibilityResponse(result.responses);
+    const providerSummary = result.providerSummary;
 
     const trace = {
       model: result.responses
@@ -1955,8 +1356,11 @@ logLlmFailed({
 
     const responseBody = {
       conversationId: conversation.id,
+      requestId: req.requestId,
+      status: providerSummary.status,
+      providerSummary,
 
-      // 기존 프론트 호환용: 첫 번째 응답을 message로 유지
+      // 기존 프론트 호환용: 배열의 첫 항목이 아니라 첫 성공 응답을 유지한다.
       message: firstResponse
         ? {
             id: firstResponse.id,
@@ -1974,24 +1378,60 @@ logLlmFailed({
       trace,
     };
 
-logApiInfo({
-  req,
-  event: "chat_request_success",
-  userId,
-  conversationId: conversation.id,
-  metadata: {
-    provider_count: result.responses.length,
-    retrieval_count: result.retrievedChunks.length,
-    total_tokens: trace.totalTokens,
-    total_latency_ms: trace.totalLatencyMs,
-    cost_estimate: trace.costEstimate,
-    success: true,
-  },
-});
+    const outcomeMetadata = {
+      outcome: providerSummary.status,
+      provider_count: providerSummary.totalCount,
+      provider_success_count: providerSummary.successCount,
+      provider_failure_count: providerSummary.failureCount,
+      successful_providers: providerSummary.successfulProviders,
+      failed_providers: providerSummary.failedProviders,
+      retrieval_count: result.retrievedChunks.length,
+      total_tokens: trace.totalTokens,
+      total_latency_ms: trace.totalLatencyMs,
+      cost_estimate: trace.costEstimate,
+      success: true,
+    };
+
+    if (providerSummary.status === "partial_success") {
+      logApiWarn({
+        req,
+        event: "chat_request_partial_success",
+        userId,
+        conversationId: conversation.id,
+        reason: "one_or_more_providers_failed",
+        recoverable: true,
+        metadata: outcomeMetadata,
+      });
+    } else {
+      logApiInfo({
+        req,
+        event: "chat_request_success",
+        userId,
+        conversationId: conversation.id,
+        metadata: outcomeMetadata,
+      });
+    }
 
     if (activeSpan) {
       activeSpan.setTag("app.llm.model", trace.model || "unknown");
-      activeSpan.setTag("app.llm.provider_count", result.responses.length);
+      activeSpan.setTag("app.chat.outcome", providerSummary.status);
+      activeSpan.setTag("app.llm.provider_count", providerSummary.totalCount);
+      activeSpan.setTag(
+        "app.llm.provider_success_count",
+        providerSummary.successCount
+      );
+      activeSpan.setTag(
+        "app.llm.provider_failure_count",
+        providerSummary.failureCount
+      );
+      activeSpan.setTag(
+        "app.llm.failed_providers",
+        providerSummary.failedProviders.join(",")
+      );
+      activeSpan.setTag(
+        "app.llm.degraded",
+        providerSummary.status === "partial_success"
+      );
       activeSpan.setTag("app.llm.total_tokens", trace.totalTokens);
       activeSpan.setTag("app.llm.cost_estimate", trace.costEstimate);
       activeSpan.setTag("app.retrieval.count", result.retrievedChunks.length);
@@ -2004,6 +1444,13 @@ logApiInfo({
 
     return res.json(responseBody);
     } catch (error) {
+    const errorCode = classifyServerError(error, "chat_unavailable");
+    const statusCode = Number(
+      error?.statusCode || getErrorDefinition(errorCode).status
+    );
+    const failedProviders =
+      error?.providerSummary?.failedProviders?.join(",") || undefined;
+
     logApiError({
       req,
       event: "chat_request_failed",
@@ -2012,84 +1459,124 @@ logApiInfo({
       conversationId: req.body?.conversationId || "new",
       recoverable: false,
       metadata: {
+        error_code: errorCode,
+        outcome: "failed",
+        failed_providers: error?.providerSummary?.failedProviders,
         message_preview: String(req.body?.message ?? "").slice(0, 100),
       },
     });
 
-    if (requestSpan) {
-      requestSpan.setTag("error", true);
-      requestSpan.setTag("error.type", error.name || "Error");
-      requestSpan.setTag("error.message", error.message || "unknown error");
-      requestSpan.setTag("error.stack", error.stack || "");
-      requestSpan.setTag("http.status_code", 500);
-      requestSpan.setTag("app.error.handled", true);
-    }
-
-    return res.status(500).json({
-      error: error?.message || "internal server error",
+    markSpanError(requestSpan, error, {
+      "app.error.code": errorCode,
+      "app.error.handled": true,
+      "app.chat.outcome": "failed",
+      "app.llm.failed_providers": failedProviders,
+      "http.status_code": statusCode,
     });
+
+    return sendApiError(req, res, errorCode, { status: statusCode });
   }
 });
 
-const port = Number(process.env.PORT || 3001);
+app.use((req, res) => sendApiError(req, res, "route_not_found"));
 
-logger.info("app_starting", {
-  port,
-  embedding_model: EMBEDDING_MODEL,
-  openai_model: OPENAI_MODEL,
-  azure_openai_model: AZURE_OPENAI_MODEL,
-  azure_enabled: Boolean(azureClient),
-  rag_chunk_size: RAG_CHUNK_SIZE,
-  rag_chunk_overlap: RAG_CHUNK_OVERLAP,
-  rag_top_k: RAG_TOP_K,
-});
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
 
-try {
-  await initDatabase();
-} catch (error) {
-logger.error("db_init_failed", {
-    event: "db_init_failed",
-    severity: "critical",
-    database: "mysql",
-    host: process.env.MYSQL_HOST,
-    database_name: process.env.MYSQL_DATABASE,
-    recoverable: false,
-    error: {
-        name: error.name,
-        message: error.message,
-        code: error.code,
-        stack: error.stack,
+  const isInvalidJson =
+    error instanceof SyntaxError &&
+    error.status === 400 &&
+    Object.prototype.hasOwnProperty.call(error, "body");
+  const isCorsError = String(error?.message || "").includes(
+    "not allowed by CORS"
+  );
+  const errorCode = isInvalidJson
+    ? "invalid_json"
+    : isCorsError
+    ? "cors_not_allowed"
+    : classifyServerError(error, "internal_server_error");
+
+  logApiError({
+    req,
+    event: "unhandled_api_error",
+    error,
+    userId: req.user?.userId,
+    recoverable: errorCode !== "cors_not_allowed",
+    metadata: {
+      error_code: errorCode,
     },
-});
-
-  console.error("FATAL: failed to initialize database:", error.message);
-  process.exit(1);
-}
-
-try {
-  await initRAG();
-} catch (error) {
-logger.error("rag_init_failed", {
-    event: "rag_init_failed",
-    embedding_model: EMBEDDING_MODEL,
-    chunk_size: RAG_CHUNK_SIZE,
-    overlap: RAG_CHUNK_OVERLAP,
-    top_k: RAG_TOP_K,
-    recoverable: false,
-    error: {
-        message: error.message,
-        stack: error.stack,
-    },
-});
-
-  console.error("FATAL: failed to initialize RAG index:", error.message);
-  process.exit(1);
-}
-
-app.listen(port, () => {
-  logger.info("app_listening", {
-    url: `http://localhost:${port}`,
   });
 
-  console.log(`API listening on http://localhost:${port}`);
+  markActiveSpanError(error, {
+    "app.error.code": errorCode,
+    "app.error.handled": true,
+  });
+
+  return sendApiError(req, res, errorCode);
 });
+
+async function startApplication() {
+  logger.info("app_starting", {
+    event: "app_starting",
+    port: config.port,
+    version: config.version,
+    embedding_model: EMBEDDING_MODEL,
+    openai_model: OPENAI_MODEL,
+    azure_openai_model: AZURE_OPENAI_MODEL,
+    azure_enabled: Boolean(azureClient),
+    rag_chunk_size: RAG_CHUNK_SIZE,
+    rag_chunk_overlap: RAG_CHUNK_OVERLAP,
+    rag_top_k: RAG_TOP_K,
+    llm_request_timeout_ms: config.llmRequestTimeoutMs,
+    shutdown_timeout_ms: config.shutdownTimeoutMs,
+  });
+
+  for (const warning of configWarnings) {
+    logger.warn("configuration_warning", {
+      event: "configuration_warning",
+      warning,
+    });
+  }
+
+  await initDatabase();
+  runtimeState.databaseReady = true;
+
+  await initRAG();
+  runtimeState.ragReady = true;
+
+  const server = app.listen(config.port, () => {
+    logger.info("app_listening", {
+      event: "app_listening",
+      url: `http://localhost:${config.port}`,
+      readiness_url: `http://localhost:${config.port}/health/ready`,
+    });
+    console.log(`API listening on http://localhost:${config.port}`);
+  });
+
+  const shutdown = createShutdownController({
+    server,
+    runtimeState,
+    closeDatabase,
+    logger,
+  });
+  installProcessHandlers({ shutdown, logger });
+}
+
+try {
+  await startApplication();
+} catch (error) {
+  logger.error("app_start_failed", {
+    event: "app_start_failed",
+    severity: "critical",
+    recoverable: false,
+    error,
+  });
+
+  if (runtimeState.databaseReady) {
+    await closeDatabase().catch(() => {});
+  }
+  logger.close();
+  process.exitCode = 1;
+}

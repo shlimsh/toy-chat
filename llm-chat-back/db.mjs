@@ -1,11 +1,12 @@
 import mysql from "mysql2/promise";
 import logger from "./logger.mjs";
+import { config } from "./config.mjs";
 
-const DB_HOST = process.env.MYSQL_HOST || "127.0.0.1";
-const DB_PORT = Number(process.env.MYSQL_PORT || 3306);
-const DB_USER = process.env.MYSQL_USER || "toy_chat_user";
-const DB_PASSWORD = process.env.MYSQL_PASSWORD || "";
-const DB_NAME = process.env.MYSQL_DATABASE || "toy_chat";
+const DB_HOST = config.mysql.host;
+const DB_PORT = config.mysql.port;
+const DB_USER = config.mysql.user;
+const DB_PASSWORD = config.mysql.password;
+const DB_NAME = config.mysql.database;
 const DB_SSL_ENABLED =
   String(process.env.MYSQL_SSL || "").toLowerCase() === "true";
 
@@ -40,6 +41,21 @@ const pool = mysql.createPool(poolConfig);
 export async function query(sql, params = []) {
   const [rows] = await pool.execute(sql, params);
   return rows;
+}
+
+export async function checkDatabase() {
+  await query("SELECT 1 AS ok");
+  return true;
+}
+
+export async function closeDatabase() {
+  logger.info("db_pool_closing", {
+    event: "db_pool_closing",
+  });
+  await pool.end();
+  logger.info("db_pool_closed", {
+    event: "db_pool_closed",
+  });
 }
 
 export async function initDatabase() {
