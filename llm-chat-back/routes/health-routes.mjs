@@ -14,8 +14,19 @@ export function createHealthRouter(runtimeState) {
       service: config.service,
       version: config.version,
       openaiModel: config.openaiModel,
+      openaiEnabled: config.openaiEnabled,
       azureOpenAIModel: config.azureModel,
       azureEnabled: config.azureEnabled,
+      providers: [
+        ...(config.openaiEnabled ? ["OpenAI"] : []),
+        ...(config.azureEnabled ? ["Azure AI"] : []),
+      ],
+      rag: {
+        status: runtimeState.ragStatus,
+        mode: runtimeState.ragMode,
+        documentCount: runtimeState.ragDocumentCount,
+        chunkCount: runtimeState.ragChunkCount,
+      },
     });
   });
 
@@ -54,13 +65,10 @@ export function createHealthRouter(runtimeState) {
 
     const checks = {
       database: database ? "ready" : databaseMessage || "not_ready",
-      rag: runtimeState.ragReady ? "ready" : "not_ready",
+      rag: runtimeState.ragStatus,
       acceptingRequests: runtimeState.shuttingDown ? "no" : "yes",
     };
-    const ok =
-      database &&
-      runtimeState.ragReady &&
-      !runtimeState.shuttingDown;
+    const ok = database && !runtimeState.shuttingDown;
 
     res.status(ok ? 200 : 503).json({
       ok,
@@ -68,6 +76,13 @@ export function createHealthRouter(runtimeState) {
       service: config.service,
       version: config.version,
       checks,
+      optionalDependencies: {
+        rag: {
+          ready: runtimeState.ragReady,
+          mode: runtimeState.ragMode,
+          errorCode: runtimeState.ragErrorCode,
+        },
+      },
     });
   });
 

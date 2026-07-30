@@ -10,10 +10,6 @@ function required(name, value) {
 
 export const runtimeConfig = Object.freeze({
   apiBaseUrl: String(import.meta.env.VITE_API_BASE_URL || "").trim(),
-  lambdaApiUrl: String(
-    import.meta.env.VITE_LAMBDA_API_URL ||
-      "https://zxezp1ixj5.execute-api.us-east-1.amazonaws.com/shlim/send"
-  ).trim(),
   datadog: Object.freeze({
     applicationId: String(
       import.meta.env.VITE_DD_APPLICATION_ID ||

@@ -1,0 +1,77 @@
+name: toy-chat Quality Gate
+
+on:
+  push:
+    branches:
+      - haha
+  pull_request:
+    branches:
+      - haha
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      DD_VERSION: 0.0.0
+      JWT_SECRET: ci-only-secret
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: toy_chat
+      MYSQL_USER: toy_chat_user
+      MYSQL_PASSWORD: ""
+      OPENAI_API_KEY: ci-placeholder-key
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            llm-chat-back/package-lock.json
+            llm-chat/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: llm-chat-back
+        run: npm ci
+
+      - name: Test backend
+        working-directory: llm-chat-back
+        run: npm test
+
+      - name: Check backend syntax
+        working-directory: llm-chat-back
+        run: npm run check
+
+      - name: Prepare release environment
+        run: cp llm-chat-back/.env.example llm-chat-back/.env
+
+      - name: Install frontend dependencies
+        working-directory: llm-chat
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: llm-chat
+        run: npm test
+
+      - name: Lint frontend
+        working-directory: llm-chat
+        run: npm run lint
+
+      - name: Verify Browser SDK v7
+        working-directory: llm-chat
+        run: npm run verify:rum-v7
+
+      - name: Build frontend and verify Source Maps
+        working-directory: llm-chat
+        run: npm run build

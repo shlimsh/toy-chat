@@ -11,7 +11,14 @@ export function buildProviderHistory(messages, provider, options = {}) {
       if (message?.role === "user") return true;
       if (message?.role !== "assistant") return false;
 
-      return normalizeProvider(message.metadata?.provider) === targetProvider;
+      const status = String(message.metadata?.status || "success")
+        .trim()
+        .toLowerCase();
+
+      return (
+        status === "success" &&
+        normalizeProvider(message.metadata?.provider) === targetProvider
+      );
     })
     .slice(-Math.max(1, limit))
     .map((message) => ({
@@ -19,4 +26,3 @@ export function buildProviderHistory(messages, provider, options = {}) {
       content: String(message.content ?? ""),
     }));
 }
-

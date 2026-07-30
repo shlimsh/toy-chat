@@ -1,0 +1,22 @@
+# toy-chat 운영 및 장애 대응
+
+## 로컬 실행
+백엔드는 llm-chat-back에서 npm install 후 npm run dev로 시작한다. 실행 명령의 node --enable-source-maps는 백엔드 Stack을 원본 mjs 위치로 표시한다. 프런트는 llm-chat에서 npm install 후 npm run dev로 시작한다.
+
+백엔드가 시작되지 않으면 환경설정 검증 메시지를 먼저 확인한다. JWT_SECRET, MySQL 연결 정보, DD_VERSION과 OpenAI 또는 Azure AI 중 하나 이상의 Provider 설정이 필요하다. OpenAI와 Azure AI를 모두 설정할 필요는 없다.
+
+## Provider 장애
+한 Provider만 실패해도 다른 Provider가 성공하면 HTTP 200과 partial_success를 반환한다. Datadog APM에서 resource_name:"POST /chat" Trace를 열고 llm.provider.request 자식 Span의 error.type, error.message, error.stack을 확인한다. 모든 활성 Provider가 실패하면 AllProvidersFailedError와 HTTP 503이 기록된다.
+
+Azure-only 구성에서는 OpenAI 요청을 만들지 않는다. OpenAI-only 구성에서는 Azure 실패 카드를 만들지 않는다. 비활성 Provider를 매번 호출해 상시 partial_success가 되는 상태는 정상 구성이 아니다.
+
+## RAG 장애
+/health 또는 /health/ready 응답의 rag.status와 rag.mode를 확인한다. mode=hybrid는 Embedding과 Keyword를 함께 사용하고, hybrid_partial은 일부 캐시 Embedding과 Keyword를 사용하며, keyword는 Embedding 없이 Keyword만 사용한다. unavailable은 문서 로딩 자체가 실패해 빈 Context로 답변하는 상태다.
+
+로그의 rag_initialized 이벤트에서 document_count, chunk_count, embedded_chunk_count, reused_embedding_count, generated_embedding_count를 확인한다. chat_retrieval_completed 이벤트에는 retrieval_strategy, retrieved_chunk_ids, retrieval_scores와 degraded reason이 남는다.
+
+## Source Map
+브라우저 Source Map은 llm-chat에서 npm run release:rum으로 빌드, 검증, 업로드한다. 실제 Datadog 역변환은 npm run preview:rum으로 프로덕션 번들을 실행해 새 오류를 발생시킨 뒤 확인한다. RUM service, version, JavaScript URL prefix와 업로드 값이 모두 일치해야 한다.
+
+## 배포 전 검사
+백엔드에서 npm test와 npm run check를 실행한다. 프런트에서 npm test, npm run lint, npm run build를 실행한다. GitHub Actions Quality Gate는 haha 브랜치 Push와 Pull Request에서 같은 핵심 검사를 수행한다.

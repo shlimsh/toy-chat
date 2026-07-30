@@ -15,6 +15,11 @@ const ERROR_MESSAGES = Object.freeze({
     "백엔드 오류 테스트가 정상적으로 실행되었습니다. Normal 모드로 변경한 뒤 다시 시도해 주세요.",
   monitoring_unavailable:
     "모니터링 데이터를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.",
+  sms_not_configured: "문자 발송 기능이 아직 설정되지 않았습니다.",
+  sms_rate_limited:
+    "문자 발송 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+  sms_unavailable:
+    "문자 발송 서비스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
   database_unavailable:
     "데이터 저장소에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
   chat_unavailable:
@@ -62,6 +67,8 @@ const RETRYABLE_CODES = new Set([
   "request_timeout",
   "malformed_response",
   "monitoring_unavailable",
+  "sms_rate_limited",
+  "sms_unavailable",
   "database_unavailable",
   "chat_unavailable",
   "service_shutting_down",

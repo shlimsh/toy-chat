@@ -1,0 +1,25 @@
+# Datadog Agent와 Kubernetes
+
+## Agent 역할
+Datadog Agent는 호스트나 컨테이너 환경에서 메트릭, 로그, Trace, 프로세스와 통합 데이터를 수집한다. 상태 확인 명령으로 실행 중인 Check, Endpoint 연결, 오류를 확인할 수 있다. 문제 분석 자료가 필요하면 Agent Flare를 생성해 설정과 로그 정보를 수집할 수 있다.
+
+## Kubernetes 설치 방식
+Kubernetes에서는 Datadog Helm Chart 또는 Datadog Operator를 사용해 Agent를 배포할 수 있다. Node Agent는 일반적으로 DaemonSet으로 각 노드에서 실행되고, Cluster Agent는 Kubernetes API와 Cluster 수준 기능을 담당한다.
+
+Helm은 선언한 Values를 기반으로 Kubernetes 리소스를 배포한다. Operator는 DatadogAgent Custom Resource의 원하는 상태를 지속적으로 조정하는 Reconciliation Loop를 사용한다. Operator를 사용할 때는 Custom Resource 상태에서 배포 진행과 오류를 확인할 수 있다.
+
+## 로그와 태그
+containerCollectAll을 활성화하면 기본적으로 많은 컨테이너 로그가 수집될 수 있으므로 include와 exclude 규칙을 명확히 설계한다. Include와 Exclude가 함께 있을 때의 우선순위를 확인하고 Namespace, Image, Container 이름 같은 기준을 사용한다.
+
+컨테이너 Label을 Datadog Tag로 변환하려면 DD_CONTAINER_LABELS_AS_TAGS 매핑을 설정한다. 이 설정은 실제 컨테이너에 존재하는 Label 값을 읽어 Tag로 변환하는 것이며 존재하지 않는 Label 값을 새로 만들어 주지는 않는다.
+
+## 장애 확인 순서
+Agent Pod 상태와 재시작 횟수, Agent status 출력, Cluster Agent 연결, API Key와 Site, Proxy 및 Egress 허용, 리소스 Limit을 순서대로 확인한다. 로그가 없으면 로그 수집 활성화 여부, Container Include/Exclude, 파일 경로와 권한, Multiline 규칙을 점검한다.
+
+## 공식 출처
+https://docs.datadoghq.com/agent/
+https://docs.datadoghq.com/agent/configuration/agent-commands/
+https://docs.datadoghq.com/agent/troubleshooting/
+https://docs.datadoghq.com/containers/kubernetes/installation/
+https://docs.datadoghq.com/containers/datadog_operator/
+https://docs.datadoghq.com/containers/cluster_agent/setup/

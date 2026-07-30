@@ -9,3 +9,7 @@
 **/coverage/
 **/logs/
 **/.sourcemap-test-*/
+llm-chat-back/data/chat.db
+llm-chat-back/data/chat.db-shm
+llm-chat-back/data/chat.db-wal
+llm-chat-back/data/rag-cache.json

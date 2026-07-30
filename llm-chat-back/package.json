@@ -23,11 +23,5 @@
     "mysql2": "^3.20.0",
     "openai": "^6.32.0",
     "winston": "^3.19.0"
-  },
-  "devDependencies": {
-    "@vitest/ui": "^4.1.9",
-    "cross-env": "^7.0.3",
-    "mocha": "^11.7.6",
-    "vitest": "^4.1.9"
   }
 }

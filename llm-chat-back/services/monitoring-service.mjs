@@ -59,6 +59,40 @@ function sessions(value) {
   return count === 1 ? "1 session" : `${count} sessions`;
 }
 
+function queryTagValue(value) {
+  return String(value || "unknown").replace(/[{},\s]/g, "_");
+}
+
+function metricName(value) {
+  const normalized = String(value || "").trim();
+  return /^[A-Za-z][A-Za-z0-9_.]*$/.test(normalized)
+    ? normalized
+    : "rum.measure.session";
+}
+
+export function buildMonitoringQueries({
+  service,
+  env,
+  rumService,
+  rumMetric,
+}) {
+  const backendScope = `env:${queryTagValue(env)},service:${queryTagValue(
+    service
+  )}`;
+  const rumScope = `env:${queryTagValue(env)},service:${queryTagValue(
+    rumService
+  )}`;
+
+  return {
+    cpu: "avg:system.cpu.idle{*} by {host}",
+    memory: "avg:system.mem.pct_usable{*} by {host}",
+    latency:
+      `avg:trace.express.request.duration{${backendScope}} by {resource_name}`,
+    visitors:
+      `sum:${metricName(rumMetric)}{${rumScope}} by {usr.name}.as_count()`,
+  };
+}
+
 export function topCpuHosts(result, limit = 3) {
   return (result.series || [])
     .map((series) => {
@@ -127,42 +161,72 @@ export function topVisitorUsers(result, limit = 3) {
     .slice(0, limit);
 }
 
-export async function getMonitoringSummary(metricsApi, now = new Date()) {
+export async function getMonitoringSummary(
+  metricsApi,
+  {
+    now = new Date(),
+    service = "shlim-toy-chat-api",
+    env = "dev",
+    rumService = "shlim-toy-chat-front",
+    rumMetric = "rum.measure.session",
+  } = {}
+) {
   const { fromSec, toSec } = todayRangeSecKst(now);
-  const [cpuResult, memoryResult, latencyResult, visitorsResult] =
-    await Promise.all([
+  const queries = buildMonitoringQueries({
+    service,
+    env,
+    rumService,
+    rumMetric,
+  });
+  const metricNames = Object.keys(queries);
+  const settled = await Promise.allSettled(
+    metricNames.map((name) =>
       metricsApi.queryMetrics({
         from: fromSec,
         to: toSec,
-        query: "avg:system.cpu.idle{*} by {host}",
-      }),
-      metricsApi.queryMetrics({
-        from: fromSec,
-        to: toSec,
-        query: "avg:system.mem.pct_usable{*} by {host}",
-      }),
-      metricsApi.queryMetrics({
-        from: fromSec,
-        to: toSec,
-        query:
-          "avg:trace.express.request.duration{env:dev,service:shlim-toy-chat-api} by {resource_name}",
-      }),
-      metricsApi.queryMetrics({
-        from: fromSec,
-        to: toSec,
-        query: "sum:custom.user{*} by {usr.name}.as_count()",
-      }),
-    ]);
+        query: queries[name],
+      })
+    )
+  );
+  const results = Object.fromEntries(
+    metricNames.map((name, index) => [
+      name,
+      settled[index].status === "fulfilled"
+        ? settled[index].value
+        : { series: [] },
+    ])
+  );
+  const availability = Object.fromEntries(
+    metricNames.map((name, index) => [
+      name,
+      settled[index].status === "fulfilled",
+    ])
+  );
+  const unavailableMetrics = metricNames.filter(
+    (name) => !availability[name]
+  );
 
-  const cpuHosts = topCpuHosts(cpuResult);
-  const memoryHosts = topMemoryHosts(memoryResult);
-  const latencyResources = topLatencyResources(latencyResult);
-  const visitorsUsers = topVisitorUsers(visitorsResult);
+  if (unavailableMetrics.length === metricNames.length) {
+    const error = new Error("All monitoring metric queries failed");
+    error.code = "MONITORING_ALL_QUERIES_FAILED";
+    error.failedMetrics = unavailableMetrics;
+    throw error;
+  }
+
+  const cpuHosts = topCpuHosts(results.cpu);
+  const memoryHosts = topMemoryHosts(results.memory);
+  const latencyResources = topLatencyResources(results.latency);
+  const visitorsUsers = topVisitorUsers(results.visitors);
   const visitorsTotal = total(
-    (visitorsResult.series || []).flatMap((series) => values(series.pointlist))
+    (results.visitors.series || []).flatMap((series) =>
+      values(series.pointlist)
+    )
   );
 
   return {
+    status: unavailableMetrics.length > 0 ? "partial" : "success",
+    availability,
+    unavailableMetrics,
     range: {
       timezone: "Asia/Seoul",
       from: fromSec,
@@ -172,7 +236,9 @@ export async function getMonitoringSummary(metricsApi, now = new Date()) {
       cpu: cpuHosts[0]?.displayValue || "-",
       memory: memoryHosts[0]?.displayValue || "-",
       latency: latencyResources[0]?.displayValue || "-",
-      visitors: `${Math.round(visitorsTotal)} sessions`,
+      visitors: availability.visitors
+        ? `${Math.round(visitorsTotal)} sessions`
+        : "-",
     },
     details: {
       cpuHosts,

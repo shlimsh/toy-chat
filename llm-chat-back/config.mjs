@@ -35,6 +35,17 @@ function integer(value, fallback, { name, min, max }, issues) {
   return normalized;
 }
 
+function decimal(value, fallback, { name, min, max }, issues) {
+  const normalized = Number(value ?? fallback);
+
+  if (!Number.isFinite(normalized) || normalized < min || normalized > max) {
+    issues.push(`${name}은(는) ${min}~${max} 범위의 숫자여야 합니다.`);
+    return fallback;
+  }
+
+  return normalized;
+}
+
 function csv(value, fallback = []) {
   const items = String(value ?? "")
     .split(",")
@@ -42,6 +53,17 @@ function csv(value, fallback = []) {
     .filter(Boolean);
 
   return items.length > 0 ? [...new Set(items)] : fallback;
+}
+
+function enumValue(value, fallback, { name, allowed }, issues) {
+  const normalized = text(value, fallback).toLowerCase();
+
+  if (!allowed.includes(normalized)) {
+    issues.push(`${name}은(는) ${allowed.join(", ")} 중 하나여야 합니다.`);
+    return fallback;
+  }
+
+  return normalized;
 }
 
 function requireValue(env, name, issues) {
@@ -77,11 +99,40 @@ export function validateEnvironment(env = process.env) {
     min: 1,
     max: 20,
   }, issues);
+  const ragMinScore = decimal(env.RAG_MIN_SCORE, 0.18, {
+    name: "RAG_MIN_SCORE",
+    min: 0,
+    max: 1,
+  }, issues);
+  const ragMaxChunksPerDocument = integer(
+    env.RAG_MAX_CHUNKS_PER_DOCUMENT,
+    2,
+    {
+      name: "RAG_MAX_CHUNKS_PER_DOCUMENT",
+      min: 1,
+      max: 10,
+    },
+    issues
+  );
+  const ragEmbeddingBatchSize = integer(env.RAG_EMBEDDING_BATCH_SIZE, 32, {
+    name: "RAG_EMBEDDING_BATCH_SIZE",
+    min: 1,
+    max: 100,
+  }, issues);
   const spanBodyTagMax = integer(env.SPAN_BODY_TAG_MAX, 8192, {
     name: "SPAN_BODY_TAG_MAX",
     min: 512,
     max: 65_536,
   }, issues);
+  const spanBodyCaptureMode = enumValue(
+    env.SPAN_BODY_CAPTURE_MODE,
+    "metadata",
+    {
+      name: "SPAN_BODY_CAPTURE_MODE",
+      allowed: ["off", "metadata", "full"],
+    },
+    issues
+  );
   const llmRequestTimeoutMs = integer(env.LLM_REQUEST_TIMEOUT_MS, 60_000, {
     name: "LLM_REQUEST_TIMEOUT_MS",
     min: 1_000,
@@ -96,6 +147,26 @@ export function validateEnvironment(env = process.env) {
     name: "SHUTDOWN_TIMEOUT_MS",
     min: 1_000,
     max: 60_000,
+  }, issues);
+  const smsRequestTimeoutMs = integer(env.SMS_REQUEST_TIMEOUT_MS, 15_000, {
+    name: "SMS_REQUEST_TIMEOUT_MS",
+    min: 1_000,
+    max: 60_000,
+  }, issues);
+  const smsRateLimitWindowMs = integer(
+    env.SMS_RATE_LIMIT_WINDOW_MS,
+    60_000,
+    {
+      name: "SMS_RATE_LIMIT_WINDOW_MS",
+      min: 1_000,
+      max: 3_600_000,
+    },
+    issues
+  );
+  const smsRateLimitMax = integer(env.SMS_RATE_LIMIT_MAX, 3, {
+    name: "SMS_RATE_LIMIT_MAX",
+    min: 1,
+    max: 100,
   }, issues);
 
   if (ragChunkOverlap >= ragChunkSize) {
@@ -118,8 +189,14 @@ export function validateEnvironment(env = process.env) {
     );
   }
 
+  if (isProduction && spanBodyCaptureMode === "full") {
+    issues.push(
+      "운영 환경에서는 SPAN_BODY_CAPTURE_MODE=full을 사용할 수 없습니다."
+    );
+  }
+
   const jwtSecret = requireValue(env, "JWT_SECRET", issues);
-  const openaiApiKey = requireValue(env, "OPENAI_API_KEY", issues);
+  const openaiApiKey = text(env.OPENAI_API_KEY);
   const mysqlHost = requireValue(env, "MYSQL_HOST", issues);
   const mysqlUser = requireValue(env, "MYSQL_USER", issues);
   const mysqlDatabase = requireValue(env, "MYSQL_DATABASE", issues);
@@ -149,12 +226,46 @@ export function validateEnvironment(env = process.env) {
     );
   }
 
+  const openaiEnabled = Boolean(openaiApiKey);
+  const azureEnabled = Boolean(azureApiKey && azureEndpoint);
+
+  if (!openaiEnabled && !azureEnabled) {
+    issues.push(
+      "OPENAI_API_KEY 또는 Azure AI 설정 중 하나 이상이 필요합니다."
+    );
+  }
+
+  if (!openaiEnabled && azureEnabled) {
+    warnings.push(
+      "OpenAI Embedding을 사용할 수 없어 RAG는 Keyword 검색 모드로 동작합니다."
+    );
+  }
+
   const datadogApiKey = text(env.DD_API_KEY);
   const datadogAppKey = text(env.DD_APP_KEY);
   if (Boolean(datadogApiKey) !== Boolean(datadogAppKey)) {
     warnings.push(
       "Monitoring API를 사용하려면 DD_API_KEY와 DD_APP_KEY를 함께 설정해야 합니다."
     );
+  }
+
+  const smsApiUrl = text(env.SMS_API_URL);
+  if (!smsApiUrl) {
+    warnings.push(
+      "SMS_API_URL이 없어 문자 발송 기능은 비활성 상태로 동작합니다."
+    );
+  } else {
+    try {
+      const parsed = new URL(smsApiUrl);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        issues.push("SMS_API_URL은 http 또는 https URL이어야 합니다.");
+      }
+      if (isProduction && parsed.protocol !== "https:") {
+        issues.push("운영 환경의 SMS_API_URL은 https를 사용해야 합니다.");
+      }
+    } catch {
+      issues.push("SMS_API_URL이 올바른 URL 형식이 아닙니다.");
+    }
   }
 
   const config = Object.freeze({
@@ -170,6 +281,7 @@ export function validateEnvironment(env = process.env) {
       text(env.DD_SERVICE, "shlim-toy-chat")
     ),
     openaiApiKey,
+    openaiEnabled,
     openaiModel: text(env.OPENAI_MODEL, "gpt-5-mini"),
     embeddingModel: text(
       env.OPENAI_EMBEDDING_MODEL,
@@ -178,14 +290,23 @@ export function validateEnvironment(env = process.env) {
     azureApiKey,
     azureEndpoint,
     azureModel: text(env.AZURE_OPENAI_MODEL, "gpt-4o-mini"),
-    azureEnabled: Boolean(azureApiKey && azureEndpoint),
+    azureEnabled,
     ragChunkSize,
     ragChunkOverlap,
     ragTopK,
+    ragMinScore,
+    ragMaxChunksPerDocument,
+    ragEmbeddingBatchSize,
     spanBodyTagMax,
+    spanBodyCaptureMode,
     llmRequestTimeoutMs,
     readinessTimeoutMs,
     shutdownTimeoutMs,
+    smsApiUrl,
+    smsEnabled: Boolean(smsApiUrl),
+    smsRequestTimeoutMs,
+    smsRateLimitWindowMs,
+    smsRateLimitMax,
     corsOrigins,
     timingAllowOrigins,
     jwtSecret,
@@ -201,6 +322,14 @@ export function validateEnvironment(env = process.env) {
       database: mysqlDatabase,
     }),
     datadogApiEnabled: Boolean(datadogApiKey && datadogAppKey),
+    monitoringRumService: text(
+      env.MONITORING_RUM_SERVICE,
+      "shlim-toy-chat-front"
+    ),
+    monitoringRumMetric: text(
+      env.MONITORING_RUM_METRIC,
+      "rum.measure.session"
+    ),
   });
 
   return { config, issues, warnings };

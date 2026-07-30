@@ -273,6 +273,21 @@ const installFetchMock = () => {
           totalTokens: 400,
           costEstimate: "0.000559",
         },
+        rag: {
+          status: "ready",
+          mode: "hybrid",
+          retrievalStrategy: "hybrid",
+          degradedReason: null,
+          resultCount: 1,
+          sources: [
+            {
+              document: "datadog-rum.txt",
+              title: "Datadog Real User Monitoring",
+              section: "Browser SDK v7과 Source Map",
+              score: 0.812345,
+            },
+          ],
+        },
       });
     }
 
@@ -324,6 +339,9 @@ describe("toy-chat phase 1 UI integration", () => {
     expect(await screen.findByText("새 OpenAI 답변")).toBeTruthy();
     expect(await screen.findByText("새 Azure 답변")).toBeTruthy();
     expect(screen.getByText("$0.000559")).toBeTruthy();
+    expect(screen.getByText("📚 RAG Context")).toBeTruthy();
+    expect(screen.getByText("hybrid · 1")).toBeTruthy();
+    expect(screen.getByText("Datadog Real User Monitoring")).toBeTruthy();
   });
 
   test("OpenAI와 Azure 중 하나만 성공해도 정상 답변을 표시하고 전체 실패 화면은 숨긴다", async () => {

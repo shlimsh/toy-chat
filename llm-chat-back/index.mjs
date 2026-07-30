@@ -20,9 +20,8 @@ import {
   buildChunkRecords,
   loadEmbeddingCache,
   saveEmbeddingCache,
-  cosineSimilarity,
+  rankChunkRecords,
 } from "./rag.mjs";
-import { serializeTelemetry } from "./telemetry-sanitizer.mjs";
 import { buildProviderHistory } from "./conversation-history.mjs";
 import {
   classifyServerError,
@@ -46,6 +45,7 @@ import { createAuthRouter } from "./routes/auth-routes.mjs";
 import { createConversationRouter } from "./routes/conversation-routes.mjs";
 import { createHealthRouter } from "./routes/health-routes.mjs";
 import { createMonitoringRouter } from "./routes/monitoring-routes.mjs";
+import { createNotificationRouter } from "./routes/notification-routes.mjs";
 import {
   createConversation,
   createMessage,
@@ -59,9 +59,20 @@ import {
   traceProviderOperation,
 } from "./span-utils.mjs";
 import {
+  setRequestBodyOnSpan,
+  setResponseBodyOnSpan,
+} from "./lib/telemetry.mjs";
+import {
   requireProviderSuccess,
   selectCompatibilityResponse,
 } from "./provider-outcomes.mjs";
+import {
+  buildProviderRegistry,
+  createProviderJobs,
+  runProviderJobs,
+} from "./provider-registry.mjs";
+import { createFixedWindowRateLimiter } from "./rate-limit.mjs";
+import { createSmsService } from "./services/sms-service.mjs";
 
 const app = express();
 const llmobs = tracer.llmobs;
@@ -75,10 +86,15 @@ const EMBEDDING_MODEL = config.embeddingModel;
 const RAG_CHUNK_SIZE = config.ragChunkSize;
 const RAG_CHUNK_OVERLAP = config.ragChunkOverlap;
 const RAG_TOP_K = config.ragTopK;
+const RAG_MIN_SCORE = config.ragMinScore;
+const RAG_MAX_CHUNKS_PER_DOCUMENT = config.ragMaxChunksPerDocument;
+const RAG_EMBEDDING_BATCH_SIZE = config.ragEmbeddingBatchSize;
 
-const openaiClient = new OpenAI({
-  apiKey: config.openaiApiKey,
-});
+const openaiClient = config.openaiEnabled
+  ? new OpenAI({
+      apiKey: config.openaiApiKey,
+    })
+  : null;
 
 const azureClient =
   config.azureEnabled
@@ -87,6 +103,14 @@ const azureClient =
         endpoint: AZURE_OPENAI_ENDPOINT,
       }
     : null;
+
+const providerRegistry = buildProviderRegistry({
+  config,
+  clients: {
+    openai: openaiClient,
+    azure: azureClient,
+  },
+});
 
 app.use(corsMiddleware);
 app.use(timingMiddleware);
@@ -107,6 +131,14 @@ ddConfig.setServerVariables({
 
 const incidentsApi = new datadogApiClient.v2.IncidentsApi(ddConfig);
 const metricsApi = new datadogApiClient.v1.MetricsApi(ddConfig);
+const smsService = createSmsService({
+  endpoint: config.smsApiUrl,
+  timeoutMs: config.smsRequestTimeoutMs,
+});
+const smsRateLimiter = createFixedWindowRateLimiter({
+  windowMs: config.smsRateLimitWindowMs,
+  max: config.smsRateLimitMax,
+});
 
 function safeJsonParse(value, fallback = {}) {
   try {
@@ -116,31 +148,10 @@ function safeJsonParse(value, fallback = {}) {
   }
 }
 
-const SPAN_BODY_TAG_MAX = config.spanBodyTagMax;
-
-function truncateForSpan(str) {
-  if (typeof str !== "string") return str;
-  if (str.length <= SPAN_BODY_TAG_MAX) return str;
-  return `${str.slice(0, SPAN_BODY_TAG_MAX)}...[truncated ${
-    str.length - SPAN_BODY_TAG_MAX
-  } chars]`;
-}
-
-function setRequestBodyOnSpan(span, body) {
-  if (!span) return;
-  span.setTag(
-    "http.request.body",
-    truncateForSpan(serializeTelemetry(body, { maxStringLength: SPAN_BODY_TAG_MAX }))
-  );
-}
-
-function setResponseBodyOnSpan(span, body) {
-  if (!span) return;
-  span.setTag(
-    "http.response.body",
-    truncateForSpan(serializeTelemetry(body, { maxStringLength: SPAN_BODY_TAG_MAX }))
-  );
-}
+const SPAN_BODY_OPTIONS = Object.freeze({
+  mode: config.spanBodyCaptureMode,
+  maxLength: config.spanBodyTagMax,
+});
 
 async function persistAssistantMessageSafely({
   conversationId,
@@ -187,7 +198,7 @@ app.use((req, res, next) => {
   if (span) {
     span.setTag("http.method", req.method);
     span.setTag("http.route.path", req.path);
-    setRequestBodyOnSpan(span, req.body);
+    setRequestBodyOnSpan(span, req.body, SPAN_BODY_OPTIONS);
   }
 
   const originalJson = res.json.bind(res);
@@ -196,7 +207,7 @@ app.use((req, res, next) => {
   res.json = function patchedJson(body) {
     const currentSpan = tracer.scope().active() || span;
     if (currentSpan) {
-      setResponseBodyOnSpan(currentSpan, body);
+      setResponseBodyOnSpan(currentSpan, body, SPAN_BODY_OPTIONS);
       currentSpan.setTag("http.status_code", res.statusCode);
     }
     return originalJson(body);
@@ -206,7 +217,7 @@ app.use((req, res, next) => {
     const currentSpan = tracer.scope().active() || span;
     if (currentSpan) {
       const parsed = typeof body === "string" ? safeJsonParse(body, body) : body;
-      setResponseBodyOnSpan(currentSpan, parsed);
+      setResponseBodyOnSpan(currentSpan, parsed, SPAN_BODY_OPTIONS);
       currentSpan.setTag("http.status_code", res.statusCode);
     }
     return originalSend(body);
@@ -215,42 +226,79 @@ app.use((req, res, next) => {
   next();
 });
 
-const embedTextForIndexing = llmobs.wrap(
-  { kind: "embedding", name: "embed_document_chunk" },
-  async function embedTextForIndexing({ text, chunkId, docId }) {
-    const safeText = String(text ?? "");
+const embedDocumentBatch = llmobs.wrap(
+  { kind: "embedding", name: "embed_document_chunks" },
+  async function embedDocumentBatch(chunks) {
+    if (!openaiClient) {
+      const error = new Error("OpenAI Embedding client is not configured");
+      error.code = "RAG_EMBEDDING_PROVIDER_DISABLED";
+      throw error;
+    }
+
+    const safeChunks = chunks.map((chunk) => ({
+      ...chunk,
+      text: String(chunk.text ?? ""),
+    }));
 
     const response = await withRequestTimeout(
-      "document embedding",
+      "document embedding batch",
       config.llmRequestTimeoutMs,
       (signal) =>
         openaiClient.embeddings.create(
           {
             model: EMBEDDING_MODEL,
-            input: safeText,
+            input: safeChunks.map((chunk) => chunk.text),
           },
           { signal }
         )
     );
 
-    const embedding = response.data?.[0]?.embedding || [];
+    const embeddings = [...(response.data || [])]
+      .sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
+      .map((item) => item.embedding || []);
+
+    if (
+      embeddings.length !== safeChunks.length ||
+      embeddings.some((embedding) => embedding.length === 0)
+    ) {
+      const error = new Error("Embedding batch response is incomplete");
+      error.code = "RAG_EMBEDDING_RESPONSE_INVALID";
+      throw error;
+    }
 
     llmobs.annotate(undefined, {
-      inputData: safeText,
-      outputData: `embedding_dimensions=${embedding.length}`,
+      inputData: JSON.stringify(
+        safeChunks.map((chunk) => ({
+          chunkId: chunk.id,
+          docId: chunk.docId,
+        }))
+      ),
+      outputData: JSON.stringify({
+        embeddingCount: embeddings.length,
+        embeddingDimensions: embeddings[0]?.length || 0,
+      }),
       tags: {
         "embedding.model": EMBEDDING_MODEL,
         "embedding.scope": "document",
-        "rag.chunk_id": chunkId,
-        "rag.doc_id": docId,
+        "rag.embedding.batch_size": String(safeChunks.length),
       },
     });
 
-    return embedding;
+    return embeddings;
   }
 );
 
 let VECTOR_STORE = [];
+let RAG_INDEX_STATE = {
+  status: "initializing",
+  mode: "unavailable",
+  documentCount: 0,
+  chunkCount: 0,
+  embeddedChunkCount: 0,
+  reusedCount: 0,
+  generatedCount: 0,
+  errorCode: null,
+};
 
 async function initRAG() {
   const docs = await loadDocuments();
@@ -273,7 +321,7 @@ async function initRAG() {
   }
 
   const nextCache = {
-    version: 1,
+    version: 2,
     embeddingModel: EMBEDDING_MODEL,
     updatedAt: new Date().toISOString(),
     chunks: {},
@@ -283,6 +331,7 @@ async function initRAG() {
 
   let reusedCount = 0;
   let generatedCount = 0;
+  let embeddingError = null;
 
   await llmobs.trace(
     {
@@ -291,32 +340,73 @@ async function initRAG() {
       mlApp: ML_APP,
     },
     async () => {
-      for (const chunk of chunkRecords) {
-        let embedding = null;
-
+      VECTOR_STORE = chunkRecords.map((chunk) => {
         const cached =
           !cacheModelMismatch && cache.chunks ? cache.chunks[chunk.hash] : null;
 
-        if (cached?.embedding?.length) {
-          embedding = cached.embedding;
-          reusedCount += 1;
-        } else {
-          embedding = await embedTextForIndexing({
-            text: chunk.text,
-            chunkId: chunk.id,
-            docId: chunk.docId,
-          });
-          generatedCount += 1;
-        }
+        const embedding = cached?.embedding?.length
+          ? cached.embedding
+          : null;
+        if (embedding) reusedCount += 1;
 
-        const item = {
+        return {
           ...chunk,
           embedding,
         };
+      });
 
-        VECTOR_STORE.push(item);
-        nextCache.chunks[chunk.hash] = item;
+      const missingIndexes = VECTOR_STORE.flatMap((item, index) =>
+        item.embedding?.length ? [] : [index]
+      );
+
+      if (openaiClient) {
+        for (
+          let offset = 0;
+          offset < missingIndexes.length;
+          offset += RAG_EMBEDDING_BATCH_SIZE
+        ) {
+          const batchIndexes = missingIndexes.slice(
+            offset,
+            offset + RAG_EMBEDDING_BATCH_SIZE
+          );
+          const batch = batchIndexes.map((index) => VECTOR_STORE[index]);
+
+          try {
+            const embeddings = await embedDocumentBatch(batch);
+            embeddings.forEach((embedding, index) => {
+              VECTOR_STORE[batchIndexes[index]].embedding = embedding;
+            });
+            generatedCount += embeddings.length;
+          } catch (error) {
+            embeddingError = error;
+            logLlmFailed({
+              provider: "OpenAI Embeddings",
+              model: EMBEDDING_MODEL,
+              stage: "initialize_rag_index",
+              error,
+            });
+            break;
+          }
+        }
       }
+
+      for (const item of VECTOR_STORE) {
+        if (item.embedding?.length) {
+          nextCache.chunks[item.hash] = item;
+        }
+      }
+
+      const embeddedChunkCount = VECTOR_STORE.filter(
+        (item) => item.embedding?.length
+      ).length;
+      const mode =
+        !openaiClient
+          ? "keyword"
+          : embeddedChunkCount === VECTOR_STORE.length && VECTOR_STORE.length > 0
+          ? "hybrid"
+          : embeddedChunkCount > 0
+          ? "hybrid_partial"
+          : "keyword";
 
       llmobs.annotate(undefined, {
         inputData: JSON.stringify({
@@ -328,24 +418,88 @@ async function initRAG() {
           reusedCount,
           generatedCount,
           embeddingModel: EMBEDDING_MODEL,
+          embeddedChunkCount,
+          mode,
+          degraded: Boolean(embeddingError || !openaiClient),
         }),
+        tags: {
+          "rag.status": embeddingError || !openaiClient ? "degraded" : "ready",
+          "rag.mode": mode,
+          "rag.cache.reused_count": String(reusedCount),
+          "rag.embedding.generated_count": String(generatedCount),
+          "rag.embedding.chunk_count": String(embeddedChunkCount),
+        },
       });
     }
   );
 
   saveEmbeddingCache(nextCache);
 
+  const embeddedChunkCount = VECTOR_STORE.filter(
+    (item) => item.embedding?.length
+  ).length;
+  const mode =
+    !openaiClient
+      ? "keyword"
+      : embeddedChunkCount === VECTOR_STORE.length && VECTOR_STORE.length > 0
+      ? "hybrid"
+      : embeddedChunkCount > 0
+      ? "hybrid_partial"
+      : "keyword";
+  const status =
+    docs.length > 0 && !embeddingError && openaiClient ? "ready" : "degraded";
+
+  RAG_INDEX_STATE = {
+    status,
+    mode,
+    documentCount: docs.length,
+    chunkCount: VECTOR_STORE.length,
+    embeddedChunkCount,
+    reusedCount,
+    generatedCount,
+    errorCode:
+      embeddingError?.code ||
+      (!openaiClient ? "RAG_EMBEDDING_PROVIDER_DISABLED" : null),
+  };
+
   logger.info("rag_initialized", {
+    rag_status: status,
+    rag_mode: mode,
     chunk_count: VECTOR_STORE.length,
     document_count: docs.length,
+    embedded_chunk_count: embeddedChunkCount,
     reused_embedding_count: reusedCount,
     generated_embedding_count: generatedCount,
     embedding_model: EMBEDDING_MODEL,
+    error_code: RAG_INDEX_STATE.errorCode,
   });
 
   console.log(
-    `RAG initialized with ${VECTOR_STORE.length} chunks (reused=${reusedCount}, generated=${generatedCount})`
+    `RAG initialized with ${VECTOR_STORE.length} chunks (mode=${mode}, reused=${reusedCount}, generated=${generatedCount})`
   );
+
+  return RAG_INDEX_STATE;
+}
+
+function buildRagTrace({
+  retrievedChunks = [],
+  retrievalStrategy = "skipped",
+  degradedReason = null,
+} = {}) {
+  return {
+    status: RAG_INDEX_STATE.status,
+    mode: RAG_INDEX_STATE.mode,
+    retrievalStrategy,
+    degradedReason,
+    resultCount: retrievedChunks.length,
+    sources: retrievedChunks.map((chunk) => ({
+      document: chunk.docId,
+      title: chunk.title,
+      section: chunk.section,
+      source: chunk.sources?.[0] || null,
+      score: Number(chunk.score.toFixed(6)),
+    })),
+  };
 }
 
 function shouldUseTimeTool(message) {
@@ -474,6 +628,12 @@ const queryDatadogTool = llmobs.wrap(
 const embedUserQuery = llmobs.wrap(
   { kind: "embedding", name: "embed_user_query" },
   async function embedUserQuery(queryText) {
+    if (!openaiClient) {
+      const error = new Error("OpenAI Embedding client is not configured");
+      error.code = "RAG_EMBEDDING_PROVIDER_DISABLED";
+      throw error;
+    }
+
     const safeQuery = String(queryText ?? "");
 
     const response = await withRequestTimeout(
@@ -509,18 +669,16 @@ const retrieveRelevantChunks = llmobs.wrap(
   function retrieveRelevantChunks({ query: queryText, queryEmbedding, topK = 3 }) {
     const safeQuery = String(queryText ?? "");
 
-    const scored = VECTOR_STORE.map((item) => {
-      const score = cosineSimilarity(queryEmbedding, item.embedding);
-      return {
-        ...item,
-        score,
-      };
+    const top = rankChunkRecords(VECTOR_STORE, {
+      query: safeQuery,
+      queryEmbedding,
+      topK,
+      minScore: RAG_MIN_SCORE,
+      maxChunksPerDocument: RAG_MAX_CHUNKS_PER_DOCUMENT,
     });
-
-    const top = scored
-      .filter((item) => Number.isFinite(item.score))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    const strategy =
+      top[0]?.retrievalStrategy ||
+      (queryEmbedding?.length ? "hybrid" : "keyword");
 
     llmobs.annotate(undefined, {
       inputData: safeQuery,
@@ -529,13 +687,22 @@ const retrieveRelevantChunks = llmobs.wrap(
           id: item.id,
           docId: item.docId,
           name: item.name,
+          section: item.section,
           score: Number(item.score.toFixed(6)),
+          semanticScore:
+            item.semanticScore === null
+              ? null
+              : Number(item.semanticScore.toFixed(6)),
+          lexicalScore: Number(item.lexicalScore.toFixed(6)),
+          strategy: item.retrievalStrategy,
           textPreview: item.text.slice(0, 200),
         }))
       ),
       tags: {
-        "retrieval.strategy": "cosine_similarity",
+        "retrieval.strategy": strategy,
         "retrieval.top_k": String(topK),
+        "retrieval.result_count": String(top.length),
+        "retrieval.min_score": String(RAG_MIN_SCORE),
         "retrieval.vector_store_size": String(VECTOR_STORE.length),
       },
     });
@@ -618,8 +785,8 @@ async function runAzureFoundryModel({
   baseMessages,
   docsContext,
 }) {
-  const endpoint = process.env.AZURE_OPENAI_ENDPOINT?.trim();
-  const apiKey = process.env.AZURE_OPENAI_API_KEY?.trim();
+  const endpoint = config.azureEndpoint;
+  const apiKey = config.azureApiKey;
 
   if (!endpoint || !apiKey) {
     throw new Error("Azure Foundry endpoint or API key is not configured");
@@ -885,10 +1052,14 @@ async function runModelWithTools({
 app.use("/health", createHealthRouter(runtimeState));
 app.use("/auth", createAuthRouter());
 app.use("/conversations", createConversationRouter());
-app.get("/monitoring/test", (_req, res) => {
-  res.json({ ok: true, message: "monitoring route alive" });
-});
 app.use("/api/monitoring", createMonitoringRouter({ metricsApi }));
+app.use(
+  "/api/notifications",
+  createNotificationRouter({
+    smsService,
+    limiter: smsRateLimiter,
+  })
+);
 
 app.post("/chat", authRequired, async (req, res) => {
   const requestSpan = tracer.scope().active();
@@ -933,7 +1104,9 @@ logChatRequest({
   requestId: req.requestId,
   message,
   provider: "compare",
-  model: `${OPENAI_MODEL} / ${AZURE_OPENAI_MODEL}`,
+  model: providerRegistry
+    .map((provider) => `${provider.provider}:${provider.model}`)
+    .join(" / "),
 });
 
     let conversation;
@@ -1029,6 +1202,8 @@ logApiInfo({
             });
 
             let retrievedChunks = [];
+            let retrievalStrategy = "skipped";
+            let retrievalDegradedReason = null;
 
             if (intent.needDocs) {
               try {
@@ -1046,7 +1221,33 @@ logApiInfo({
                     },
                   },
                   async () => {
-                    const queryEmbedding = await embedUserQuery(String(message));
+                    let queryEmbedding = null;
+                    const hasEmbeddedChunks = VECTOR_STORE.some(
+                      (item) => item.embedding?.length
+                    );
+
+                    if (openaiClient && hasEmbeddedChunks) {
+                      try {
+                        queryEmbedding = await embedUserQuery(String(message));
+                      } catch (error) {
+                        retrievalDegradedReason =
+                          error?.code || "query_embedding_failed";
+                        logLlmFailed({
+                          userId,
+                          conversationId: conversation.id,
+                          requestId: req.requestId,
+                          provider: "OpenAI Embeddings",
+                          model: EMBEDDING_MODEL,
+                          stage: "chat_query_embedding",
+                          error,
+                        });
+                      }
+                    } else {
+                      retrievalDegradedReason = openaiClient
+                        ? "no_embedded_chunks"
+                        : "embedding_provider_disabled";
+                    }
+
                     return retrieveRelevantChunks({
                       query: String(message),
                       queryEmbedding,
@@ -1054,6 +1255,9 @@ logApiInfo({
                     });
                   }
                 );
+                retrievalStrategy =
+                  retrievedChunks[0]?.retrievalStrategy ||
+                  (retrievalDegradedReason ? "keyword" : "hybrid");
 
                 logger.info("chat_retrieval_completed", {
                   event: "chat_retrieval_completed",
@@ -1065,12 +1269,19 @@ logApiInfo({
                   retrieval_scores: retrievedChunks.map((chunk) =>
                     Number(chunk.score.toFixed(6))
                   ),
+                  retrieval_strategy: retrievalStrategy,
+                  retrieval_degraded_reason: retrievalDegradedReason,
+                  rag_status: RAG_INDEX_STATE.status,
+                  rag_mode: RAG_INDEX_STATE.mode,
                   embedding_model: EMBEDDING_MODEL,
                 });
               } catch (error) {
                 // RAG 보강 실패가 Azure/OpenAI의 일반 답변까지 막지 않도록
                 // 빈 Context로 계속 진행하되, 실패한 child span과 error log는 남긴다.
                 retrievedChunks = [];
+                retrievalStrategy = "unavailable";
+                retrievalDegradedReason =
+                  error?.code || "rag_retrieval_failed";
                 logLlmFailed({
                   userId,
                   conversationId: conversation.id,
@@ -1089,62 +1300,65 @@ logApiInfo({
                   retrievedChunks
                     .map(
                       (chunk, idx) =>
-                        `${idx + 1}. ${chunk.docId}\n${chunk.text}\n(score: ${chunk.score.toFixed(
+                        `${idx + 1}. ${chunk.title || chunk.docId} > ${
+                          chunk.section || "본문"
+                        }\n${chunk.text}\n(source: ${
+                          chunk.sources?.[0] || chunk.docId
+                        }, strategy: ${chunk.retrievalStrategy}, score: ${chunk.score.toFixed(
                           4
                         )})`
                     )
                     .join("\n\n")
                 : "";
 
-const modelJobs = [
-  {
-    provider: "OpenAI",
-    model: OPENAI_MODEL,
-    runner: () =>
+const modelJobs = createProviderJobs({
+  providers: providerRegistry,
+  runners: {
+    openai: (provider) => () =>
       traceProviderOperation(
         {
-          provider: "OpenAI",
-          model: OPENAI_MODEL,
+          provider: provider.provider,
+          model: provider.model,
           requestId: req.requestId,
           conversationId: conversation.id,
         },
         () =>
           runModelWithTools({
-            provider: "OpenAI",
-            client: openaiClient,
-            model: OPENAI_MODEL,
-            baseMessages: buildProviderHistory(history, "OpenAI"),
+            provider: provider.provider,
+            client: provider.client,
+            model: provider.model,
+            baseMessages: buildProviderHistory(
+              history,
+              provider.provider
+            ),
             docsContext,
             conversationId: conversation.id,
             userId,
           })
       ),
-  },
-  {
-    provider: "Azure AI",
-    model: AZURE_OPENAI_MODEL,
-    runner: () =>
+    azure: (provider) => () =>
       traceProviderOperation(
         {
-          provider: "Azure AI",
-          model: AZURE_OPENAI_MODEL,
+          provider: provider.provider,
+          model: provider.model,
           requestId: req.requestId,
           conversationId: conversation.id,
         },
         () =>
           runAzureFoundryModel({
-            provider: "Azure AI",
-            model: AZURE_OPENAI_MODEL,
-            baseMessages: buildProviderHistory(history, "Azure AI"),
+            provider: provider.provider,
+            model: provider.model,
+            baseMessages: buildProviderHistory(
+              history,
+              provider.provider
+            ),
             docsContext,
           })
       ),
   },
-];
+});
 
-const settled = await Promise.allSettled(
-  modelJobs.map((job) => job.runner())
-);
+const settled = await runProviderJobs(modelJobs);
 
             const responses = [];
 
@@ -1164,6 +1378,11 @@ const settled = await Promise.allSettled(
                   completionTokens: value.completionTokens,
                   usedTools: value.usedTools,
                   retrievalCount: retrievedChunks.length,
+                  rag: buildRagTrace({
+                    retrievedChunks,
+                    retrievalStrategy,
+                    degradedReason: retrievalDegradedReason,
+                  }),
                 };
 
                 const persistence = await persistAssistantMessageSafely({
@@ -1185,6 +1404,11 @@ const settled = await Promise.allSettled(
                     tool_names: value.usedTools,
                     retrieved_chunk_ids: retrievedChunks.map((chunk) => chunk.id),
                     retrieval_count: retrievedChunks.length,
+                    retrieval_strategy: retrievalStrategy,
+                    retrieval_degraded_reason: retrievalDegradedReason,
+                    retrieval_scores: retrievedChunks.map((chunk) =>
+                      Number(chunk.score.toFixed(6))
+                    ),
                     user_id: userId,
                     request_id: req.requestId,
                     trace: responseTrace,
@@ -1235,6 +1459,11 @@ logLlmCompleted({
                   error: providerError.message,
                   errorCode: providerError.code,
                   retryable: providerError.retryable,
+                  rag: buildRagTrace({
+                    retrievedChunks,
+                    retrievalStrategy,
+                    degradedReason: retrievalDegradedReason,
+                  }),
                 };
 
                 const persistence = await persistAssistantMessageSafely({
@@ -1311,6 +1540,8 @@ logLlmFailed({
               responses,
               retrievedChunks,
               providerSummary,
+              retrievalStrategy,
+              retrievalDegradedReason,
             };
           }
         );
@@ -1332,6 +1563,11 @@ logLlmFailed({
 
     const firstResponse = selectCompatibilityResponse(result.responses);
     const providerSummary = result.providerSummary;
+    const ragTrace = buildRagTrace({
+      retrievedChunks: result.retrievedChunks,
+      retrievalStrategy: result.retrievalStrategy,
+      degradedReason: result.retrievalDegradedReason,
+    });
 
     const trace = {
       model: result.responses
@@ -1352,6 +1588,8 @@ logLlmFailed({
         .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
         .toFixed(6),
       retrievalCount: result.retrievedChunks.length,
+      retrievalStrategy: result.retrievalStrategy,
+      rag: ragTrace,
     };
 
     const responseBody = {
@@ -1376,6 +1614,7 @@ logLlmFailed({
       responses: result.responses,
 
       trace,
+      rag: ragTrace,
     };
 
     const outcomeMetadata = {
@@ -1386,6 +1625,10 @@ logLlmFailed({
       successful_providers: providerSummary.successfulProviders,
       failed_providers: providerSummary.failedProviders,
       retrieval_count: result.retrievedChunks.length,
+      retrieval_strategy: result.retrievalStrategy,
+      retrieval_degraded_reason: result.retrievalDegradedReason,
+      rag_status: RAG_INDEX_STATE.status,
+      rag_mode: RAG_INDEX_STATE.mode,
       total_tokens: trace.totalTokens,
       total_latency_ms: trace.totalLatencyMs,
       cost_estimate: trace.costEstimate,
@@ -1435,11 +1678,27 @@ logLlmFailed({
       activeSpan.setTag("app.llm.total_tokens", trace.totalTokens);
       activeSpan.setTag("app.llm.cost_estimate", trace.costEstimate);
       activeSpan.setTag("app.retrieval.count", result.retrievedChunks.length);
+      activeSpan.setTag(
+        "app.retrieval.strategy",
+        result.retrievalStrategy
+      );
+      if (result.retrievalDegradedReason) {
+        activeSpan.setTag(
+          "app.retrieval.degraded_reason",
+          result.retrievalDegradedReason
+        );
+      }
+      activeSpan.setTag("app.rag.status", RAG_INDEX_STATE.status);
+      activeSpan.setTag("app.rag.mode", RAG_INDEX_STATE.mode);
       activeSpan.setTag("app.rag.embedding_model", EMBEDDING_MODEL);
       activeSpan.setTag("app.rag.chunk_size", RAG_CHUNK_SIZE);
       activeSpan.setTag("app.rag.chunk_overlap", RAG_CHUNK_OVERLAP);
       activeSpan.setTag("app.rag.top_k", RAG_TOP_K);
-      setResponseBodyOnSpan(activeSpan, responseBody);
+      setResponseBodyOnSpan(
+        activeSpan,
+        responseBody,
+        SPAN_BODY_OPTIONS
+      );
     }
 
     return res.json(responseBody);
@@ -1524,13 +1783,22 @@ async function startApplication() {
     version: config.version,
     embedding_model: EMBEDDING_MODEL,
     openai_model: OPENAI_MODEL,
+    openai_enabled: config.openaiEnabled,
     azure_openai_model: AZURE_OPENAI_MODEL,
     azure_enabled: Boolean(azureClient),
+    enabled_providers: providerRegistry.map((provider) => provider.provider),
     rag_chunk_size: RAG_CHUNK_SIZE,
     rag_chunk_overlap: RAG_CHUNK_OVERLAP,
     rag_top_k: RAG_TOP_K,
+    rag_min_score: RAG_MIN_SCORE,
+    rag_max_chunks_per_document: RAG_MAX_CHUNKS_PER_DOCUMENT,
+    rag_embedding_batch_size: RAG_EMBEDDING_BATCH_SIZE,
     llm_request_timeout_ms: config.llmRequestTimeoutMs,
     shutdown_timeout_ms: config.shutdownTimeoutMs,
+    span_body_capture_mode: config.spanBodyCaptureMode,
+    sms_enabled: config.smsEnabled,
+    sms_rate_limit_max: config.smsRateLimitMax,
+    sms_rate_limit_window_ms: config.smsRateLimitWindowMs,
   });
 
   for (const warning of configWarnings) {
@@ -1543,8 +1811,39 @@ async function startApplication() {
   await initDatabase();
   runtimeState.databaseReady = true;
 
-  await initRAG();
-  runtimeState.ragReady = true;
+  try {
+    const ragState = await initRAG();
+    runtimeState.ragReady = ragState.chunkCount > 0;
+    runtimeState.ragStatus = ragState.status;
+    runtimeState.ragMode = ragState.mode;
+    runtimeState.ragDocumentCount = ragState.documentCount;
+    runtimeState.ragChunkCount = ragState.chunkCount;
+    runtimeState.ragErrorCode = ragState.errorCode;
+  } catch (error) {
+    // RAG는 선택적 보강 기능이다. 문서/캐시 오류가 핵심 채팅 서버의
+    // 시작을 막지 않으며, 요청은 빈 Context로 계속 처리된다.
+    runtimeState.ragReady = false;
+    runtimeState.ragStatus = "degraded";
+    runtimeState.ragMode = "unavailable";
+    runtimeState.ragErrorCode =
+      error?.code || "RAG_INITIALIZATION_FAILED";
+    RAG_INDEX_STATE = {
+      ...RAG_INDEX_STATE,
+      status: "degraded",
+      mode: "unavailable",
+      errorCode: runtimeState.ragErrorCode,
+    };
+    VECTOR_STORE = [];
+
+    logger.error("rag_initialization_failed", {
+      event: "rag_initialization_failed",
+      severity: "error",
+      recoverable: true,
+      error,
+      error_code: runtimeState.ragErrorCode,
+      fallback_mode: "empty_context",
+    });
+  }
 
   const server = app.listen(config.port, () => {
     logger.info("app_listening", {

@@ -1,4 +1,9 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import {
   Activity,
   Cpu,
@@ -7,24 +12,31 @@ import {
   RefreshCw,
   Users,
 } from "lucide-react";
+import { runtimeConfig } from "../config/runtime-config.js";
 import { requestJson, toUserError } from "../lib/api-client.js";
 
 const UI_FONT =
   'Inter, Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", "Segoe UI", Arial, sans-serif';
 
-export default function MonitoringPage() {
+export default function MonitoringPage({ token }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const loadSummary = async () => {
+  const loadSummary = useCallback(async () => {
     setLoading(true);
     setError("");
 
     try {
-      const result = await requestJson("/api/monitoring/summary", {
-        timeoutMs: 15000,
-      });
+      const result = await requestJson(
+        `${runtimeConfig.apiBaseUrl}/api/monitoring/summary`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          timeoutMs: 15000,
+        }
+      );
 
       setData(result);
     } catch (err) {
@@ -32,11 +44,11 @@ export default function MonitoringPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     loadSummary();
-  }, []);
+  }, [loadSummary]);
 
   const cards = useMemo(() => {
     const metrics = data?.metrics || {};
@@ -109,6 +121,13 @@ export default function MonitoringPage() {
               요청 ID: {error.requestId}
             </small>
           ) : null}
+        </div>
+      ) : null}
+
+      {!loading && data?.status === "partial" ? (
+        <div role="status" aria-live="polite" style={styles.warningBox}>
+          일부 지표를 불러오지 못했습니다. 조회 가능한 데이터만
+          표시합니다.
         </div>
       ) : null}
 
@@ -242,6 +261,17 @@ const styles = {
   errorRequestId: {
     color: "#9f1239",
     opacity: 0.78,
+  },
+  warningBox: {
+    border: "1px solid #fde68a",
+    background: "#fffbeb",
+    color: "#92400e",
+    borderRadius: 14,
+    padding: "10px 12px",
+    fontSize: 12,
+    fontWeight: 700,
+    lineHeight: 1.5,
+    flexShrink: 0,
   },
   cardGrid: {
     display: "grid",

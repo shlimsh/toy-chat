@@ -1,4 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { NavLink } from "react-router-dom";
 import {
   LogOut,
@@ -31,6 +37,7 @@ import {
   reportFrontendError,
   reportFrontendWarning,
 } from "./lib/observability.js";
+import { sendManagerSms } from "./services/notification-service.js";
 
 const getWeatherIcon = (main = "") => {
   const value = String(main).toLowerCase();
@@ -48,7 +55,6 @@ const getWeatherIcon = (main = "") => {
   return "🌡️";
 };
 
-const LAMBDA_API_URL = runtimeConfig.lambdaApiUrl;
 const API_BASE_URL = runtimeConfig.apiBaseUrl;
 
 const TEST_MODES = {
@@ -286,6 +292,10 @@ function TracePanel({
 const providerTraces = Array.isArray(currentTrace?.models)
   ? currentTrace.models
   : [];
+const ragTrace = currentTrace?.rag || null;
+const ragSources = Array.isArray(ragTrace?.sources)
+  ? ragTrace.sources.slice(0, 2)
+  : [];
 
 const runtimeItems =
   providerTraces.length > 0
@@ -382,7 +392,9 @@ const runtimeItems =
             <div style={styles.runtimeEyebrow}>LLM OBSERVABILITY</div>
             <div style={styles.runtimeTitle}>AI Runtime</div>
           </div>
-          <div style={styles.runtimeBadge}>Dual Model</div>
+          <div style={styles.runtimeBadge}>
+            {providerTraces.length === 1 ? "Single Model" : "Dual Model"}
+          </div>
         </div>
 
         <div style={styles.runtimeProviderList}>
@@ -441,6 +453,35 @@ style={{
             <strong>{totalCost}</strong>
           </div>
         </div>
+
+        {ragTrace ? (
+          <div style={styles.runtimeRagBox}>
+            <div style={styles.runtimeRagHeader}>
+              <span>📚 RAG Context</span>
+              <strong>
+                {ragTrace.mode || "unknown"} · {ragTrace.resultCount || 0}
+              </strong>
+            </div>
+            <div style={styles.runtimeRagMeta}>
+              {ragTrace.retrievalStrategy || "skipped"}
+              {ragTrace.degradedReason
+                ? ` · ${ragTrace.degradedReason}`
+                : ""}
+            </div>
+            {ragSources.map((source) => (
+              <div
+                key={`${source.document}-${source.section}`}
+                style={styles.runtimeRagSource}
+                title={`${source.title || source.document} > ${
+                  source.section || "본문"
+                }`}
+              >
+                <span>{source.title || source.document}</span>
+                <strong>{Number(source.score || 0).toFixed(3)}</strong>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
 
       <div style={styles.sideBox}>
@@ -650,10 +691,10 @@ export default function App() {
     });
   };
 
-  const scrollToBottom = () => {
+  const scrollToBottom = useCallback(() => {
     if (!chatScrollRef.current) return;
     chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-  };
+  }, []);
 
   const focusInput = () => {
     requestAnimationFrame(() => {
@@ -661,7 +702,7 @@ export default function App() {
     });
   };
 
-  const loadConversations = async () => {
+  const loadConversations = useCallback(async () => {
     if (!token) return;
     conversationListRequestRef.current?.abort();
     const controller = new AbortController();
@@ -692,9 +733,9 @@ export default function App() {
         conversationListRequestRef.current = null;
       }
     }
-  };
+  }, [token]);
 
-  const loadMessages = async (targetConversationId) => {
+  const loadMessages = useCallback(async (targetConversationId) => {
     if (!targetConversationId || !token) return;
     messageListRequestRef.current?.abort();
     const controller = new AbortController();
@@ -767,6 +808,10 @@ if (latestAssistantTraces.length > 0) {
     costEstimate: successfulTraces
       .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
       .toFixed(6),
+    rag:
+      successfulTraces.find((item) => item.rag)?.rag ||
+      latestAssistantTraces.find((item) => item.rag)?.rag ||
+      null,
   });
 } else {
   setCurrentTrace(null);
@@ -789,13 +834,13 @@ requestAnimationFrame(scrollToBottom);
         messageListRequestRef.current = null;
       }
     }
-  };
+  }, [scrollToBottom, token]);
 
 useEffect(() => {
   if (!authChecking && token && user) {
     loadConversations();
   }
-}, [authChecking, token, user]);
+}, [authChecking, loadConversations, token, user]);
 
   useEffect(() => {
   if (conversationId) {
@@ -812,11 +857,11 @@ useEffect(() => {
     setMessages(initialMessages);
     setCurrentTrace(null);
   }
-}, [conversationId]);
+}, [conversationId, loadMessages]);
 
   useEffect(() => {
     requestAnimationFrame(scrollToBottom);
-  }, [messages, loading]);
+  }, [loading, messages, scrollToBottom]);
 
   const logout = () => {
     setAuthNotice("");
@@ -1007,21 +1052,10 @@ const daily = (forecast.list || [])
 }, []);
 
   const sendSmsToManager = async () => {
-  console.log("SMS button clicked");
-
   try {
     datadogRum.addAction("send_sms_to_manager_click");
 
-    await requestJson(LAMBDA_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        message: "담당자에게 문자 발송 요청",
-      }),
-      timeoutMs: 15000,
-    });
+    await sendManagerSms(token);
 
     openModal(
       "문자 발송 완료",
@@ -1150,7 +1184,28 @@ if (successfulAssistantMessages.length === 0) {
 
 setMessages((prev) => [...prev, ...assistantMessages]);
 
-setCurrentTrace(data.trace || null);
+setCurrentTrace(
+  data?.trace
+    ? {
+        ...data.trace,
+        rag: data.rag || data.trace.rag || null,
+      }
+    : null
+);
+
+if (data?.rag) {
+  datadogRum.addAction("chat_rag_retrieval", {
+    request_id: data?.requestId,
+    rag_status: data.rag.status,
+    rag_mode: data.rag.mode,
+    retrieval_strategy: data.rag.retrievalStrategy,
+    retrieval_result_count: data.rag.resultCount,
+    retrieval_documents: (data.rag.sources || []).map(
+      (source) => source.document
+    ),
+    degraded_reason: data.rag.degradedReason,
+  });
+}
 
 if (data?.status === "partial_success") {
   const failedProviders = data?.providerSummary?.failedProviders || [];
@@ -1380,6 +1435,7 @@ loadConversations();
             <AppRoutes
               conversations={conversations}
               currentTrace={currentTrace}
+              token={token}
               chatProps={{
                 TEST_MODES,
                 selectedMode,
@@ -2417,6 +2473,40 @@ runtimeTotalRow: {
   fontSize: 12,
   color: COLORS.softMuted,
   fontWeight: 800,
+},
+runtimeRagBox: {
+  marginTop: 10,
+  borderRadius: 14,
+  border: "1px solid #dbeafe",
+  background: "#f8fbff",
+  padding: 10,
+  display: "grid",
+  gap: 6,
+},
+runtimeRagHeader: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  fontSize: 11,
+  color: COLORS.text,
+  fontWeight: 900,
+},
+runtimeRagMeta: {
+  fontSize: 10,
+  color: COLORS.muted,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+},
+runtimeRagSource: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  fontSize: 10,
+  color: COLORS.softMuted,
+  minWidth: 0,
 },
 headerTop: {
   display: "flex",

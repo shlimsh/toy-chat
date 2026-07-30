@@ -3,14 +3,12 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const backendDir = path.dirname(scriptDir);
-const projectRoot = path.dirname(backendDir);
-const frontendDir = path.join(projectRoot, "llm-chat");
-const backendEnvPath = path.join(backendDir, ".env");
-const frontendEnvPath = path.join(frontendDir, ".env.local");
-const statePath = path.join(projectRoot, ".dd-version-state.json");
-const lockPath = path.join(projectRoot, ".dd-version.lock");
+const currentFile = fileURLToPath(import.meta.url);
+const defaultBackendRoot = path.dirname(path.dirname(currentFile));
+const defaultFrontendRoot = path.join(
+  path.dirname(defaultBackendRoot),
+  "llm-chat"
+);
 
 const IGNORED_NAMES = new Set([
   ".env",
@@ -31,13 +29,15 @@ const SOURCE_EXTENSIONS = new Set([
   ".json",
   ".css",
   ".html",
+  ".txt",
+  ".md",
 ]);
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function acquireLock() {
+async function acquireLock(lockPath) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       return fs.openSync(lockPath, "wx");
@@ -66,11 +66,11 @@ function sourceFiles(directory) {
   return files;
 }
 
-function sourceFingerprint() {
+function sourceFingerprint({ projectRoot, backendRoot, frontendRoot }) {
   const hash = crypto.createHash("sha256");
   const files = [
-    ...sourceFiles(backendDir),
-    ...sourceFiles(frontendDir),
+    ...sourceFiles(backendRoot),
+    ...sourceFiles(frontendRoot),
   ].sort();
 
   for (const file of files) {
@@ -86,8 +86,10 @@ function readText(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
-function envValue(content, name) {
-  const match = content.match(new RegExp(`^${name}\\s*=\\s*(.+)$`, "m"));
+export function readEnvValue(content, name) {
+  const match = String(content).match(
+    new RegExp(`^${name}\\s*=\\s*(.+)$`, "m")
+  );
   return match?.[1]?.trim() || "";
 }
 
@@ -95,13 +97,15 @@ function parseVersion(value) {
   const match = String(value).match(/^(\d+)\.(\d+)\.(\d+)$/);
   if (!match) {
     throw new Error(
-      `DD_VERSION은 major.minor.patch 형식이어야 합니다. 현재 값: ${value || "(없음)"}`
+      `DD_VERSION은 major.minor.patch 형식이어야 합니다. 현재 값: ${
+        value || "(없음)"
+      }`
     );
   }
   return match.slice(1).map(Number);
 }
 
-function bumpPatch(version) {
+export function incrementPatch(version) {
   const [major, minor, patch] = parseVersion(version);
   return `${major}.${minor}.${patch + 1}`;
 }
@@ -125,7 +129,7 @@ function writeAtomic(filePath, content) {
   fs.renameSync(temporaryPath, filePath);
 }
 
-function readState() {
+function readState(statePath) {
   try {
     return JSON.parse(readText(statePath));
   } catch {
@@ -133,58 +137,89 @@ function readState() {
   }
 }
 
-const lockHandle = await acquireLock();
+export async function syncDatadogVersion({
+  backendRoot = defaultBackendRoot,
+  frontendRoot = defaultFrontendRoot,
+} = {}) {
+  const projectRoot = path.dirname(backendRoot);
+  const backendEnvPath = path.join(backendRoot, ".env");
+  const frontendEnvPath = path.join(frontendRoot, ".env.local");
+  const statePath = path.join(projectRoot, ".dd-version-state.json");
+  const lockPath = path.join(projectRoot, ".dd-version.lock");
+  const lockHandle = await acquireLock(lockPath);
 
-try {
-  const backendEnv = readText(backendEnvPath);
-  if (!backendEnv) {
-    throw new Error(
-      "llm-chat-back/.env가 없습니다. 기존 .env를 유지한 상태에서 다시 실행하세요."
+  try {
+    const backendEnv = readText(backendEnvPath);
+    if (!backendEnv) {
+      throw new Error(
+        "llm-chat-back/.env가 없습니다. 기존 .env를 유지한 상태에서 다시 실행하세요."
+      );
+    }
+
+    const fingerprint = sourceFingerprint({
+      projectRoot,
+      backendRoot,
+      frontendRoot,
+    });
+    const state = readState(statePath);
+    const currentVersion = readEnvValue(backendEnv, "DD_VERSION");
+    parseVersion(currentVersion);
+
+    const changed = state.sourceFingerprint !== fingerprint;
+    const nextVersion = changed
+      ? incrementPatch(currentVersion)
+      : currentVersion;
+
+    writeAtomic(
+      backendEnvPath,
+      setEnvValue(backendEnv, "DD_VERSION", nextVersion)
     );
+    writeAtomic(
+      frontendEnvPath,
+      setEnvValue(
+        readText(frontendEnvPath),
+        "VITE_DD_VERSION",
+        nextVersion
+      )
+    );
+    writeAtomic(
+      statePath,
+      `${JSON.stringify(
+        {
+          version: nextVersion,
+          sourceFingerprint: fingerprint,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    return {
+      version: nextVersion,
+      changed,
+      sourceFingerprint: fingerprint,
+    };
+  } finally {
+    fs.closeSync(lockHandle);
+    fs.rmSync(lockPath, { force: true });
   }
-
-  const fingerprint = sourceFingerprint();
-  const state = readState();
-  const currentVersion = envValue(backendEnv, "DD_VERSION");
-  parseVersion(currentVersion);
-
-  const nextVersion =
-    state.sourceFingerprint === fingerprint
-      ? currentVersion
-      : bumpPatch(currentVersion);
-
-  writeAtomic(
-    backendEnvPath,
-    setEnvValue(backendEnv, "DD_VERSION", nextVersion)
-  );
-  writeAtomic(
-    frontendEnvPath,
-    setEnvValue(
-      readText(frontendEnvPath),
-      "VITE_DD_VERSION",
-      nextVersion
-    )
-  );
-  writeAtomic(
-    statePath,
-    `${JSON.stringify(
-      {
-        version: nextVersion,
-        sourceFingerprint: fingerprint,
-        updatedAt: new Date().toISOString(),
-      },
-      null,
-      2
-    )}\n`
-  );
-
-  console.log(
-    state.sourceFingerprint === fingerprint
-      ? `[DD_VERSION] ${nextVersion} 유지`
-      : `[DD_VERSION] ${currentVersion} → ${nextVersion}`
-  );
-} finally {
-  fs.closeSync(lockHandle);
-  fs.rmSync(lockPath, { force: true });
 }
 
+const isDirectExecution =
+  process.argv[1] && path.resolve(process.argv[1]) === currentFile;
+
+if (isDirectExecution) {
+  syncDatadogVersion()
+    .then((result) => {
+      console.log(
+        result.changed
+          ? `[DD_VERSION] patch → ${result.version}`
+          : `[DD_VERSION] ${result.version} 유지`
+      );
+    })
+    .catch((error) => {
+      console.error(error.message);
+      process.exitCode = 1;
+    });
+}

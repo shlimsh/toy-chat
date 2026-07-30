@@ -1,0 +1,18 @@
+# Datadog Database Monitoring
+
+## DBM이 제공하는 정보
+Database Monitoring은 데이터베이스 상태와 성능을 Query 중심으로 분석한다. Query Metrics는 정규화된 Query별 실행 시간, 호출 수, 대기와 부하 추세를 보여주며 Query Samples는 특정 시점에 실행된 개별 Query 실행 정보를 조사하는 데 사용한다.
+
+데이터베이스 종류와 설정에 따라 Explain Plan, Blocking Query, 연결, Buffer, Failover와 같은 추가 정보를 확인할 수 있다. APM과 DBM을 연결하면 느린 애플리케이션 Trace에서 관련 데이터베이스 Query 성능으로 이동할 수 있다.
+
+## Parameter와 개인정보
+DBM은 민감정보 노출을 줄이기 위해 Query를 정규화하거나 Parameter 값을 난독화할 수 있다. Raw Query Statement 수집을 활성화하면 실제 값이 포함될 가능성이 있으므로 권한, 수집 범위, 개인정보와 보안 정책을 먼저 검토해야 한다. 설정 한 줄만 추가하는 것 외에 지원 Agent 버전, 데이터베이스 종류별 요구 권한과 영향도 확인이 필요하다.
+
+## 분석 순서
+먼저 Query Metrics에서 부하와 지연이 큰 Query를 찾는다. Query Samples에서 실행 시점, 사용자, Client, Database와 대기 이벤트를 확인한다. APM Trace가 있다면 동일 요청의 애플리케이션 지연과 Query 실행 시간을 비교한다.
+
+## 공식 출처
+https://docs.datadoghq.com/database_monitoring/
+https://docs.datadoghq.com/database_monitoring/data_collected/
+https://docs.datadoghq.com/database_monitoring/query_metrics/
+https://docs.datadoghq.com/database_monitoring/query_samples/

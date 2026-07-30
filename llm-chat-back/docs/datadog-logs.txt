@@ -1,0 +1,20 @@
+# Datadog Log Management
+
+## 수집과 구조화
+Datadog Logs는 애플리케이션과 인프라 로그를 수집해 검색, 분석, 모니터링할 수 있게 한다. JSON 구조화 로그를 사용하면 level, service, env, version, request_id, user_id 같은 속성을 Facet과 검색 조건으로 활용하기 쉽다.
+
+Parser는 원문 로그에서 timestamp, status, logger.name, thread, message 같은 속성을 추출한다. 여러 형식이 섞이면 공통 Prefix를 먼저 파싱하고 선택 분기를 사용한다. ANSI 색상 코드와 불규칙한 공백은 파싱 전에 제거하거나 Grok 규칙에서 선택적으로 허용해야 한다.
+
+## Trace 및 RUM 상관관계
+백엔드 tracer의 로그 주입을 활성화하고 로깅 라이브러리가 Datadog Trace ID와 Span ID를 출력하면 APM Trace에서 관련 로그로 이동할 수 있다. 프런트 Browser Logs는 RUM Context와 연결되어 사용자 세션, View, Action 주변의 오류 로그를 분석할 수 있다.
+
+request_id는 RUM, APM, 백엔드 로그를 추가로 연결하는 애플리케이션 상관관계 키다. Provider별 실패와 RAG Degraded Mode도 같은 request_id로 기록하면 한 요청의 전체 흐름을 검색할 수 있다.
+
+## 민감정보 원칙
+API Key, Authorization Header, 비밀번호, Token, 전체 LLM Prompt와 답변은 기본 로그 속성으로 저장하지 않는다. 필요한 경우 마스킹하고 길이를 제한한다. 정상 응답 본문 전체보다 상태, 모델, 토큰, 지연 시간, 검색 문서 ID 같은 요약 메타데이터를 우선한다.
+
+## 공식 출처
+https://docs.datadoghq.com/logs/
+https://docs.datadoghq.com/logs/log_collection/
+https://docs.datadoghq.com/tracing/other_telemetry/connect_logs_and_traces/
+https://docs.datadoghq.com/logs/explorer/live_tail/

@@ -20,6 +20,7 @@ function PageFallback() {
 export default function AppRoutes({
   conversations,
   currentTrace,
+  token,
   chatProps,
 }) {
   return (
@@ -35,7 +36,10 @@ export default function AppRoutes({
             />
           }
         />
-        <Route path="/monitoring" element={<MonitoringPage />} />
+        <Route
+          path="/monitoring"
+          element={<MonitoringPage token={token} />}
+        />
         <Route
           path="/analytics"
           element={<AnalyticsPage conversations={conversations} />}
@@ -46,4 +50,3 @@ export default function AppRoutes({
     </Suspense>
   );
 }
-

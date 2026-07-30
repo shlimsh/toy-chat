@@ -3,12 +3,14 @@ import test from "node:test";
 
 import { createRuntimeState } from "../runtime-state.mjs";
 
-test("DB와 RAG가 모두 준비되어야 ready 상태가 된다", () => {
+test("RAG가 Degraded여도 필수 의존성인 DB가 준비되면 ready 상태가 된다", () => {
   const state = createRuntimeState();
   assert.equal(state.ready, false);
   state.databaseReady = true;
-  assert.equal(state.ready, false);
-  state.ragReady = true;
+  assert.equal(state.ready, true);
+  state.ragReady = false;
+  state.ragStatus = "degraded";
+  state.ragMode = "keyword";
   assert.equal(state.ready, true);
   state.shuttingDown = true;
   assert.equal(state.ready, false);

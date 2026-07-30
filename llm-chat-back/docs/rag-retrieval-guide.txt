@@ -1,0 +1,21 @@
+# toy-chat RAG 검색 가이드
+
+## 문서 작성 규칙
+문서는 llm-chat-back/docs 아래에 txt 또는 md 형식으로 저장한다. 첫 줄에는 # 문서 제목을 사용하고 내용은 ## Section 제목으로 나눈다. 하나의 문서는 하나의 주제를 중심으로 작성하고 공식 정보는 마지막 Section에 출처 URL을 남긴다.
+
+긴 문장을 반복하거나 여러 문서에 같은 내용을 복사하면 검색 결과의 다양성이 떨어진다. 질문에 사용할 용어와 약어를 함께 적는다. 예를 들어 Real User Monitoring과 RUM, Application Performance Monitoring과 APM을 같은 Section에 포함한다.
+
+## Chunk와 캐시
+RAG_CHUNK_SIZE는 Chunk의 최대 문자 수이고 RAG_CHUNK_OVERLAP은 인접 Chunk가 공유하는 문자 범위다. toy-chat은 문단과 문장 경계를 우선해 분할하고 Section 제목을 각 Chunk에 포함한다.
+
+Cache Key는 문서 ID와 Chunk 내용의 Hash를 사용한다. 내용이 같은 Chunk와 Embedding 모델은 캐시를 재사용하고 수정된 Chunk만 새 Embedding을 생성한다. rag-cache.json은 생성 파일이므로 실제 API Key나 비밀번호를 포함하지 않는다.
+
+처음 생성하거나 여러 문서가 변경된 경우 RAG_EMBEDDING_BATCH_SIZE 단위로 Chunk를 묶어 Embedding API를 호출한다. 기본값 32는 45개 Chunk를 개별 45회 요청하는 대신 소수의 Batch 요청으로 처리해 시작 시간과 API 호출 수를 줄인다.
+
+## 검색 점수
+Hybrid 검색은 Cosine Similarity 기반 Semantic 점수와 질문 Keyword의 일치 점수를 결합한다. RAG_MIN_SCORE보다 낮은 결과는 Prompt에서 제외한다. RAG_TOP_K는 최대 결과 수이고 RAG_MAX_CHUNKS_PER_DOCUMENT는 한 문서에서 가져올 수 있는 최대 Chunk 수다.
+
+Embedding을 사용할 수 없으면 Keyword 검색을 사용한다. 이 전환은 채팅 실패가 아니라 RAG Degraded Mode다. 검색 결과가 0개이면 모델은 Retrieved Context 없이 일반 지식으로 답변해야 하며 문서에 근거가 있었다고 주장하면 안 된다.
+
+## 품질 확인 질문
+검색 품질 검증은 APM 오류 분석, RUM 배포, Provider 장애 대응처럼 서로 다른 주제의 질문 세트로 수행한다. 응답의 rag.sources에 관련 문서 제목과 Section, 점수가 표시되는지 확인하고, 질문 자체만 반복한 문서가 상위 결과를 차지하지 않는지도 점검한다.

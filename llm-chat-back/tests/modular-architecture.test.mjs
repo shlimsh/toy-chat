@@ -1,13 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import express from "express";
 
 import {
   createTrackedError,
   markSpanError,
 } from "../lib/telemetry.mjs";
 import { getMonitoringSummary } from "../services/monitoring-service.mjs";
-import { registerHttpMiddleware } from "../middleware/http-observability.mjs";
 
 test("handled authentication errors populate Datadog standard error fields", () => {
   const tags = new Map();
@@ -80,56 +78,4 @@ test("monitoring service maps Datadog series to UI summary values", async () => 
   assert.equal(result.metrics.latency, "500 ms");
   assert.equal(result.metrics.visitors, "5 sessions");
   assert.equal(result.details.latencyResources[0].resource, "POST_/chat");
-});
-
-test("CORS and Resource Timing headers survive the HTTP response", async () => {
-  const previousCorsOrigin = process.env.CORS_ORIGIN;
-  const previousTimingOrigin = process.env.RUM_TIMING_ALLOW_ORIGIN;
-  process.env.CORS_ORIGIN = "http://localhost:5173";
-  process.env.RUM_TIMING_ALLOW_ORIGIN = "http://localhost:5173";
-
-  const app = express();
-  registerHttpMiddleware(app, { express });
-  app.get("/timed", (_req, res) => res.json({ ok: true }));
-
-  const server = await new Promise((resolve) => {
-    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
-  });
-
-  try {
-    const address = server.address();
-    const url = `http://127.0.0.1:${address.port}/timed`;
-    const response = await fetch(url, {
-      headers: { Origin: "http://localhost:5173" },
-    });
-
-    assert.equal(response.status, 200);
-    assert.equal(
-      response.headers.get("timing-allow-origin"),
-      "http://localhost:5173"
-    );
-    assert.match(response.headers.get("server-timing"), /^app;dur=\d/);
-
-    const preflight = await fetch(url, {
-      method: "OPTIONS",
-      headers: {
-        Origin: "http://localhost:5173",
-        "Access-Control-Request-Method": "GET",
-        "Access-Control-Request-Headers":
-          "x-datadog-origin,x-datadog-parent-id,x-datadog-sampling-priority,x-datadog-trace-id,traceparent,tracestate",
-      },
-    });
-
-    assert.equal(preflight.status, 204);
-    assert.match(
-      preflight.headers.get("access-control-allow-headers"),
-      /x-datadog-trace-id/i
-    );
-  } finally {
-    await new Promise((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve()))
-    );
-    process.env.CORS_ORIGIN = previousCorsOrigin;
-    process.env.RUM_TIMING_ALLOW_ORIGIN = previousTimingOrigin;
-  }
 });

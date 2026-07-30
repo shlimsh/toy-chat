@@ -1,2 +1,24 @@
-Datadog APM allows you to trace requests across distributed systems.
-It provides latency breakdowns and service dependencies.
+# Datadog APM과 분산 트레이싱
+
+## 핵심 개념
+Datadog APM은 애플리케이션 요청이 여러 서비스와 데이터베이스를 통과하는 과정을 Trace로 연결한다. Trace는 하나 이상의 Span으로 구성된다. Span은 HTTP 요청, 데이터베이스 쿼리, 외부 API 호출처럼 하나의 작업 단위를 나타내며 시작 시간, 실행 시간, 오류 상태, 서비스와 리소스 정보를 가진다.
+
+서비스 이름은 논리적인 애플리케이션을, 리소스 이름은 POST /chat 같은 처리 단위를 구분하는 데 사용한다. env, service, version 태그를 일관되게 적용하면 배포 버전별 오류와 지연 시간을 비교할 수 있다.
+
+## 문제 분석 순서
+먼저 Service 페이지에서 오류율, 요청량, 지연 시간의 변화를 확인한다. 느리거나 실패한 Trace를 열어 Waterfall에서 시간이 오래 걸린 Span을 찾는다. 외부 LLM, 데이터베이스, 다른 API의 자식 Span을 비교하면 병목이 어느 의존성에서 발생했는지 구분할 수 있다.
+
+오류 Span에는 error.type, error.message, error.stack 같은 표준 오류 필드가 있어야 Error Tracking과 Trace 화면에서 원인을 확인하기 쉽다. HTTP 5xx만 기록하고 실제 Error 객체와 Stack을 남기지 않으면 오류 표시가 생겨도 원인 정보가 비어 있을 수 있다.
+
+## 로그 및 RUM 연결
+백엔드 로그에 Trace ID와 Span ID를 주입하고 JSON으로 수집하면 Trace에서 관련 로그로 이동할 수 있다. 브라우저 RUM의 allowedTracingUrls가 백엔드 주소와 일치하고 CORS가 Datadog Trace Header를 허용하면 사용자 세션에서 백엔드 Trace까지 연결할 수 있다.
+
+## toy-chat 확인 예시
+toy-chat 백엔드 서비스는 shlim-toy-chat-api이고 주요 리소스는 POST /chat이다. Provider 요청은 llm.provider.request 자식 Span으로 구분한다. 한 Provider만 실패한 부분 성공은 부모 POST /chat을 실패 처리하지 않고 실패한 Provider Span에만 오류를 남긴다. 모든 Provider가 실패할 때 부모 요청도 실패로 처리한다.
+
+## 공식 출처
+https://docs.datadoghq.com/tracing/
+https://docs.datadoghq.com/getting_started/tracing/
+https://docs.datadoghq.com/tracing/glossary/
+https://docs.datadoghq.com/tracing/trace_explorer/trace_view/
+https://docs.datadoghq.com/tracing/other_telemetry/connect_logs_and_traces/

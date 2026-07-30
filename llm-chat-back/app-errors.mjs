@@ -76,6 +76,23 @@ const ERROR_DEFINITIONS = Object.freeze({
       "모니터링 데이터를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.",
     retryable: true,
   },
+  sms_not_configured: {
+    status: 503,
+    message: "문자 발송 기능이 아직 설정되지 않았습니다.",
+    retryable: false,
+  },
+  sms_rate_limited: {
+    status: 429,
+    message:
+      "문자 발송 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+    retryable: true,
+  },
+  sms_unavailable: {
+    status: 503,
+    message:
+      "문자 발송 서비스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+    retryable: true,
+  },
   database_unavailable: {
     status: 503,
     message: "데이터 저장소에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",

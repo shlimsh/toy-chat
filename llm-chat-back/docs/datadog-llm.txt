@@ -1,1 +1,25 @@
-스몰 스몰 랭구이쥐이~
+# Datadog LLM 및 Agent Observability
+
+## Trace와 Span 구조
+LLM 애플리케이션의 Trace는 사용자 요청이 답변으로 완성되는 전체 흐름을 보여준다. Agent Span 아래에 Workflow, Task, LLM, Tool, Embedding, Retrieval Span을 중첩하면 어느 단계에서 지연, 오류, 토큰 사용량이 발생했는지 확인할 수 있다.
+
+Agent는 목표를 달성하기 위한 전체 실행을, Workflow는 여러 단계를 묶은 흐름을, Task는 분류나 변환 같은 개별 작업을 나타낸다. Tool Span은 외부 함수나 API 호출을, Embedding Span은 텍스트 벡터 생성을, Retrieval Span은 관련 Context 검색을 표현한다.
+
+## 관측해야 할 항목
+Provider와 모델, 입력 및 출력 토큰, 요청 지연 시간, 오류, Tool 사용 여부, 검색 결과 수를 기록한다. 입력과 출력 전체를 무조건 APM 태그나 로그에 저장하면 개인정보와 비용 문제가 생길 수 있으므로 운영 환경에서는 마스킹, 길이 제한, 선택적 수집 정책이 필요하다.
+
+평가 기능을 활용하면 답변 품질, 관련성, 안전성과 같은 기준을 Trace와 연결해 비교할 수 있다. 단순 성공률뿐 아니라 검색된 Context가 질문과 관련 있었는지, 응답이 근거를 사용했는지 평가하는 것이 중요하다.
+
+## toy-chat Span 설계
+toy-chat은 chat_agent_compare_models Agent 아래 process_chat_request_compare_models Workflow를 만든다. 질문 임베딩은 embed_user_query, 문서 임베딩은 embed_document_chunk, 검색은 vector_similarity_search로 기록한다. OpenAI와 Azure AI 호출은 각각 llm.provider.request 자식 Span으로 분리한다.
+
+OpenAI와 Azure AI 중 하나가 성공하면 요청 결과는 partial_success 또는 success다. 실패한 Provider Span에는 error.type, error.message, error.stack을 기록한다. 모든 Provider가 실패했을 때만 부모 POST /chat과 Agent 흐름을 실패로 처리한다.
+
+RAG가 OpenAI Embedding을 사용할 수 없으면 Keyword 검색으로 전환한다. 이때 rag.status=degraded, rag.mode=keyword, retrieval.strategy=keyword 같은 속성을 남기면 모델 장애와 RAG 성능 저하를 분리해서 확인할 수 있다.
+
+## 공식 출처
+https://docs.datadoghq.com/llm_observability/
+https://docs.datadoghq.com/llm_observability/terms/
+https://docs.datadoghq.com/llm_observability/instrumentation/sdk/
+https://docs.datadoghq.com/llm_observability/monitoring/metrics/
+https://docs.datadoghq.com/llm_observability/evaluations/

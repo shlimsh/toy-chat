@@ -7,6 +7,34 @@ import { runtimeConfig } from "../config/runtime-config.js";
 const VERSION_KEY = "toy-chat:rum-version";
 const RELOAD_KEY = "toy-chat:rum-version-reload";
 const BROWSER_SDK_MAJOR = 7;
+const TRACED_PATH_PATTERN =
+  /^\/(?:api|auth|chat|conversations|health)(?:\/|$)/;
+
+export function isTracedApplicationUrl(
+  value,
+  {
+    pageOrigin = globalThis.location?.origin,
+    apiBaseUrl = runtimeConfig.apiBaseUrl,
+  } = {}
+) {
+  if (!pageOrigin) return false;
+
+  try {
+    const url = new URL(value, pageOrigin);
+    const allowedOrigins = new Set([pageOrigin]);
+
+    if (apiBaseUrl) {
+      allowedOrigins.add(new URL(apiBaseUrl, pageOrigin).origin);
+    }
+
+    return (
+      allowedOrigins.has(url.origin) &&
+      TRACED_PATH_PATTERN.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
 
 function errorContext(error, context = {}) {
   return {
@@ -65,15 +93,7 @@ export function initializeObservability() {
     propagateTraceBaggage: false,
     allowedTracingUrls: [
       {
-        match: /\/(api|auth|chat|conversations|health)(\/|$)/,
-        propagatorTypes: ["tracecontext", "datadog"],
-      },
-      {
-        match: /https:\/\/6kw29887b6\.execute-api\.us-east-1\.amazonaws\.com/,
-        propagatorTypes: ["tracecontext", "datadog"],
-      },
-      {
-        match: /https:\/\/zxezp1ixj5\.execute-api\.us-east-1\.amazonaws\.com/,
+        match: (url) => isTracedApplicationUrl(url),
         propagatorTypes: ["tracecontext", "datadog"],
       },
     ],

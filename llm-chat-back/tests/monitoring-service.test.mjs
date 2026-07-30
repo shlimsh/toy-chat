@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildMonitoringQueries,
+  getMonitoringSummary,
   topCpuHosts,
   topLatencyResources,
   topMemoryHosts,
@@ -55,3 +57,57 @@ test("Visitors는 사용자별 세션 합계로 정렬한다", () => {
   assert.equal(result[0].displayValue, "5 sessions");
 });
 
+test("APM과 RUM 쿼리는 환경설정의 service와 env를 사용한다", () => {
+  const queries = buildMonitoringQueries({
+    service: "custom-api",
+    env: "staging",
+    rumService: "custom-front",
+    rumMetric: "rum.measure.session",
+  });
+
+  assert.match(
+    queries.latency,
+    /\{env:staging,service:custom-api\}/
+  );
+  assert.match(
+    queries.visitors,
+    /^sum:rum\.measure\.session\{env:staging,service:custom-front\}/
+  );
+});
+
+test("일부 Datadog 쿼리가 실패해도 조회 가능한 지표를 반환한다", async () => {
+  let call = 0;
+  const metricsApi = {
+    async queryMetrics() {
+      call += 1;
+      if (call === 3) throw new Error("latency unavailable");
+      return {
+        series: [series(call === 4 ? "usr.name:kim" : "host:api-1", 0.5)],
+      };
+    },
+  };
+
+  const result = await getMonitoringSummary(metricsApi);
+
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.unavailableMetrics, ["latency"]);
+  assert.equal(result.availability.cpu, true);
+  assert.equal(result.availability.latency, false);
+  assert.equal(result.metrics.latency, "-");
+  assert.equal(result.metrics.visitors, "1 sessions");
+});
+
+test("모든 Datadog 쿼리가 실패하면 전체 조회 오류로 처리한다", async () => {
+  const metricsApi = {
+    async queryMetrics() {
+      throw new Error("Datadog unavailable");
+    },
+  };
+
+  await assert.rejects(
+    () => getMonitoringSummary(metricsApi),
+    (error) =>
+      error.code === "MONITORING_ALL_QUERIES_FAILED" &&
+      error.failedMetrics.length === 4
+  );
+});
