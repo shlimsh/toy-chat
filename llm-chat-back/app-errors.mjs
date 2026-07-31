@@ -44,6 +44,16 @@ const ERROR_DEFINITIONS = Object.freeze({
     message: "대화를 찾을 수 없습니다. 새 대화를 시작해 주세요.",
     retryable: false,
   },
+  invalid_conversation_id: {
+    status: 400,
+    message: "대화 ID 형식이 올바르지 않습니다.",
+    retryable: false,
+  },
+  invalid_pagination_cursor: {
+    status: 400,
+    message: "페이지 조회 정보가 올바르지 않습니다.",
+    retryable: false,
+  },
   message_required: {
     status: 400,
     message: "질문을 입력해 주세요.",

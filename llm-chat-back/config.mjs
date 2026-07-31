@@ -168,6 +168,26 @@ export function validateEnvironment(env = process.env) {
     min: 1,
     max: 100,
   }, issues);
+  const conversationPageSize = integer(env.CONVERSATION_PAGE_SIZE, 20, {
+    name: "CONVERSATION_PAGE_SIZE",
+    min: 1,
+    max: 100,
+  }, issues);
+  const messagePageSize = integer(env.MESSAGE_PAGE_SIZE, 50, {
+    name: "MESSAGE_PAGE_SIZE",
+    min: 1,
+    max: 200,
+  }, issues);
+  const llmHistoryMessageLimit = integer(
+    env.LLM_HISTORY_MESSAGE_LIMIT,
+    80,
+    {
+      name: "LLM_HISTORY_MESSAGE_LIMIT",
+      min: 1,
+      max: 200,
+    },
+    issues
+  );
 
   if (ragChunkOverlap >= ragChunkSize) {
     issues.push("RAG_CHUNK_OVERLAP은 RAG_CHUNK_SIZE보다 작아야 합니다.");
@@ -307,6 +327,9 @@ export function validateEnvironment(env = process.env) {
     smsRequestTimeoutMs,
     smsRateLimitWindowMs,
     smsRateLimitMax,
+    conversationPageSize,
+    messagePageSize,
+    llmHistoryMessageLimit,
     corsOrigins,
     timingAllowOrigins,
     jwtSecret,

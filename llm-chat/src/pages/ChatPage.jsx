@@ -266,6 +266,9 @@ export default function ChatPage({
   sendMessage,
   chatScrollRef,
   inputRef,
+  messageHasMore,
+  loadingOlderMessages,
+  loadOlderMessages,
 }) {
   const groupedMessages = groupMessages(messages);
 
@@ -307,6 +310,26 @@ export default function ChatPage({
 
       <div style={styles.chatWrap}>
         <div ref={chatScrollRef} style={styles.chatBody}>
+          {messageHasMore ? (
+            <div style={styles.olderMessagesRow}>
+              <button
+                type="button"
+                onClick={loadOlderMessages}
+                disabled={loadingOlderMessages}
+                style={{
+                  ...styles.olderMessagesButton,
+                  ...(loadingOlderMessages
+                    ? styles.olderMessagesButtonDisabled
+                    : {}),
+                }}
+              >
+                {loadingOlderMessages
+                  ? "이전 메시지를 불러오는 중..."
+                  : "이전 메시지 불러오기"}
+              </button>
+            </div>
+          ) : null}
+
           {groupedMessages.map((group, groupIndex) => (
             <div key={`group-${groupIndex}`} style={styles.messageGroup}>
               {group.user ? (
@@ -482,6 +505,26 @@ const styles = {
   },
   messageGroup: {
     marginBottom: 22,
+  },
+  olderMessagesRow: {
+    display: "flex",
+    justifyContent: "center",
+    marginBottom: 16,
+  },
+  olderMessagesButton: {
+    minHeight: 38,
+    borderRadius: 999,
+    border: "1px solid #bfdbfe",
+    background: "#eff6ff",
+    color: "#1d4ed8",
+    padding: "0 16px",
+    fontSize: 12,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  olderMessagesButtonDisabled: {
+    cursor: "not-allowed",
+    opacity: 0.65,
   },
   userRow: {
     display: "flex",

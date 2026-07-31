@@ -164,14 +164,42 @@ const installFetchMock = () => {
       return jsonResponse({ user });
     }
 
+    if (url.endsWith("/conversations?cursor=conversation-next")) {
+      return jsonResponse({
+        conversations: [{ id: 104, title: "더 오래된 대화" }],
+        pageInfo: { hasMore: false, nextCursor: null },
+      });
+    }
+
     if (url.endsWith("/conversations")) {
-      return jsonResponse({ conversations });
+      return jsonResponse({
+        conversations,
+        pageInfo: { hasMore: true, nextCursor: "conversation-next" },
+      });
+    }
+
+    const olderMessagesMatch = url.match(
+      /\/conversations\/(\d+)\/messages\?before=1$/
+    );
+    if (olderMessagesMatch) {
+      return jsonResponse({
+        messages: [
+          {
+            id: 0,
+            role: "user",
+            content: "가장 오래된 질문",
+            created_at: "2026-07-20T03:00:00.000Z",
+          },
+        ],
+        pageInfo: { hasMore: false, nextCursor: null },
+      });
     }
 
     const messagesMatch = url.match(/\/conversations\/(\d+)\/messages$/);
     if (messagesMatch) {
       return jsonResponse({
         messages: messageSets[Number(messagesMatch[1])] || [],
+        pageInfo: { hasMore: true, nextCursor: "1" },
       });
     }
 
@@ -380,6 +408,26 @@ describe("toy-chat phase 1 UI integration", () => {
 
     const selected = await screen.findByRole("button", { name: "이전 대화" });
     expect(selected.style.background).toBe("rgb(219, 234, 254)");
+  });
+
+  test("이전 대화와 이전 메시지를 Cursor로 추가 로드한다", async () => {
+    const browserUser = userEvent.setup();
+    localStorage.setItem("authToken", "ui-test-token");
+    localStorage.setItem("authUser", JSON.stringify(user));
+    localStorage.setItem("conversationId", "101");
+
+    renderApp();
+
+    expect(await screen.findByText("저장된 OpenAI 답변")).toBeTruthy();
+    await browserUser.click(
+      screen.getByRole("button", { name: "이전 메시지 불러오기" })
+    );
+    expect(await screen.findByText("가장 오래된 질문")).toBeTruthy();
+
+    await browserUser.click(
+      screen.getByRole("button", { name: "이전 대화 더 보기" })
+    );
+    expect(await screen.findByText("더 오래된 대화")).toBeTruthy();
   });
 
   test("두 모델이 모두 실패한 대화를 복원하면 전체 지연시간을 0ms로 오표시하지 않는다", async () => {

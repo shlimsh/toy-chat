@@ -209,6 +209,35 @@ const initialMessages = [
   },
 ];
 
+const normalizeConversationMessages = (messages = []) =>
+  messages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .map((message, index) => ({
+      id: message.id || `${message.role}-${index}`,
+      role: message.role,
+      content: message.content,
+      status:
+        message.status ||
+        message.metadata?.status ||
+        (message.error || message.metadata?.error ? "failed" : undefined),
+      provider: message.provider || message.metadata?.provider || null,
+      model: message.model || message.metadata?.model || null,
+      error: message.error || null,
+      trace: message.trace || message.metadata?.trace || null,
+      rawCreatedAt: message.created_at,
+      timestamp: buildTimestampLabel(message.created_at),
+    }));
+
+const mergeUniqueMessages = (olderMessages, currentMessages) => {
+  const seen = new Set();
+  return [...olderMessages, ...currentMessages].filter((message) => {
+    const key = String(message.id);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
 function Modal({
   open,
   title,
@@ -282,6 +311,9 @@ function TracePanel({
   conversations,
   conversationId,
   onSelectConversation,
+  conversationHasMore,
+  loadingMoreConversations,
+  onLoadMoreConversations,
   nowDate,
   nowTime,
   weatherText,
@@ -494,21 +526,40 @@ style={{
           {conversations.length === 0 ? (
             <div style={styles.emptyHistory}>아직 대화가 없습니다.</div>
           ) : (
-            conversations.map((conv) => (
-              <button
-                key={conv.id}
-                onClick={() => onSelectConversation(conv.id)}
-                aria-pressed={String(conversationId) === String(conv.id)}
-                style={{
-                  ...styles.historyItem,
-                  ...(String(conversationId) === String(conv.id)
-                    ? styles.historyItemActive
-                    : {}),
-                }}
-              >
-                {conv.title}
-              </button>
-            ))
+            <>
+              {conversations.map((conv) => (
+                <button
+                  key={conv.id}
+                  onClick={() => onSelectConversation(conv.id)}
+                  aria-pressed={String(conversationId) === String(conv.id)}
+                  style={{
+                    ...styles.historyItem,
+                    ...(String(conversationId) === String(conv.id)
+                      ? styles.historyItemActive
+                      : {}),
+                  }}
+                >
+                  {conv.title}
+                </button>
+              ))}
+              {conversationHasMore ? (
+                <button
+                  type="button"
+                  onClick={onLoadMoreConversations}
+                  disabled={loadingMoreConversations}
+                  style={{
+                    ...styles.historyMoreButton,
+                    ...(loadingMoreConversations
+                      ? styles.historyMoreButtonDisabled
+                      : {}),
+                  }}
+                >
+                  {loadingMoreConversations
+                    ? "불러오는 중..."
+                    : "이전 대화 더 보기"}
+                </button>
+              ) : null}
+            </>
           )}
         </div>
       </div>
@@ -548,6 +599,13 @@ export default function App() {
     localStorage.getItem("conversationId")
   );
   const [conversations, setConversations] = useState([]);
+  const [conversationCursor, setConversationCursor] = useState(null);
+  const [conversationHasMore, setConversationHasMore] = useState(false);
+  const [loadingMoreConversations, setLoadingMoreConversations] =
+    useState(false);
+  const [messageCursor, setMessageCursor] = useState(null);
+  const [messageHasMore, setMessageHasMore] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [errorState, setErrorState] = useState(null);
   const [lastSubmittedMessage, setLastSubmittedMessage] = useState("");
   const [selectedMode, setSelectedMode] = useState(TEST_MODES.NORMAL);
@@ -589,6 +647,10 @@ export default function App() {
     setUser(null);
     setConversationId(null);
     setConversations([]);
+    setConversationCursor(null);
+    setConversationHasMore(false);
+    setMessageCursor(null);
+    setMessageHasMore(false);
     setMessages(initialMessages);
     setCurrentTrace(null);
     setErrorState(null);
@@ -702,14 +764,21 @@ export default function App() {
     });
   };
 
-  const loadConversations = useCallback(async () => {
-    if (!token) return;
+  const loadConversations = useCallback(async ({
+    append = false,
+    cursor = null,
+  } = {}) => {
+    if (!token || (append && !cursor)) return;
     conversationListRequestRef.current?.abort();
     const controller = new AbortController();
     conversationListRequestRef.current = controller;
+    if (append) setLoadingMoreConversations(true);
 
     try {
-      const data = await requestJson(`${API_BASE_URL}/conversations`, {
+      const cursorQuery = cursor
+        ? `?cursor=${encodeURIComponent(cursor)}`
+        : "";
+      const data = await requestJson(`${API_BASE_URL}/conversations${cursorQuery}`, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -717,12 +786,25 @@ export default function App() {
         signal: controller.signal,
       });
 
-      setConversations(data.conversations || []);
+      const nextConversations = data.conversations || [];
+      setConversations((current) => {
+        if (!append) return nextConversations;
+        const byId = new Map(
+          [...current, ...nextConversations].map((item) => [
+            String(item.id),
+            item,
+          ])
+        );
+        return [...byId.values()];
+      });
+      setConversationCursor(data.pageInfo?.nextCursor || null);
+      setConversationHasMore(Boolean(data.pageInfo?.hasMore));
     } catch (error) {
       if (error?.code === "request_cancelled") return;
       setErrorState({
         ...toUserError(error, "conversations"),
         retryAction: "load-conversations",
+        retryPayload: append ? cursor : null,
       });
       reportFrontendError(error, {
         event: "frontend_api_failure",
@@ -732,18 +814,31 @@ export default function App() {
       if (conversationListRequestRef.current === controller) {
         conversationListRequestRef.current = null;
       }
+      if (append) setLoadingMoreConversations(false);
     }
   }, [token]);
 
-  const loadMessages = useCallback(async (targetConversationId) => {
+  const loadMessages = useCallback(async (
+    targetConversationId,
+    { prepend = false, cursor = null } = {}
+  ) => {
     if (!targetConversationId || !token) return;
+    if (prepend && !cursor) return;
     messageListRequestRef.current?.abort();
     const controller = new AbortController();
     messageListRequestRef.current = controller;
+    if (prepend) setLoadingOlderMessages(true);
+
+    const scrollElement = chatScrollRef.current;
+    const previousScrollHeight = scrollElement?.scrollHeight || 0;
+    const previousScrollTop = scrollElement?.scrollTop || 0;
 
     try {
+      const cursorQuery = cursor
+        ? `?before=${encodeURIComponent(cursor)}`
+        : "";
       const data = await requestJson(
-        `${API_BASE_URL}/conversations/${targetConversationId}/messages`,
+        `${API_BASE_URL}/conversations/${targetConversationId}/messages${cursorQuery}`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -753,77 +848,80 @@ export default function App() {
         }
       );
 
-const restored = (data.messages || [])
-  .filter((msg) => msg.role === "user" || msg.role === "assistant")
-  .map((msg, index) => ({
-    id: msg.id || `${msg.role}-${index}`,
-    role: msg.role,
-    content: msg.content,
-    status:
-      msg.status ||
-      msg.metadata?.status ||
-      (msg.error || msg.metadata?.error ? "failed" : undefined),
-    provider: msg.provider || msg.metadata?.provider || null,
-    model: msg.model || msg.metadata?.model || null,
-    error: msg.error || null,
-    trace: msg.trace || msg.metadata?.trace || null,
-    rawCreatedAt: msg.created_at,
-    timestamp: buildTimestampLabel(msg.created_at),
-  }));
+      const restored = normalizeConversationMessages(data.messages || []);
+      setMessageCursor(data.pageInfo?.nextCursor || null);
+      setMessageHasMore(Boolean(data.pageInfo?.hasMore));
 
-setMessages(restored.length > 0 ? restored : initialMessages);
+      if (prepend) {
+        setMessages((current) => mergeUniqueMessages(restored, current));
+        requestAnimationFrame(() => {
+          if (!scrollElement) return;
+          const addedHeight = scrollElement.scrollHeight - previousScrollHeight;
+          scrollElement.scrollTop = previousScrollTop + addedHeight;
+        });
+        return;
+      }
 
-const latestUserIndex = restored.reduce(
-  (latest, msg, index) => (msg.role === "user" ? index : latest),
-  -1
-);
+      setMessages(restored.length > 0 ? restored : initialMessages);
 
-const latestAssistantTraces = restored
-  .slice(latestUserIndex + 1)
-  .filter((msg) => msg.role === "assistant" && msg.trace)
-  .map((msg) => msg.trace);
+      const latestUserIndex = restored.reduce(
+        (latest, message, index) =>
+          message.role === "user" ? index : latest,
+        -1
+      );
+      const latestAssistantTraces = restored
+        .slice(latestUserIndex + 1)
+        .filter((message) => message.role === "assistant" && message.trace)
+        .map((message) => message.trace);
 
-if (latestAssistantTraces.length > 0) {
-  const successfulTraces = latestAssistantTraces.filter(
-    (item) => !item.error
-  );
+      if (latestAssistantTraces.length > 0) {
+        const successfulTraces = latestAssistantTraces.filter(
+          (item) => !item.error
+        );
 
-  setCurrentTrace({
-    model: latestAssistantTraces
-      .map((item) => `${item.provider}: ${item.model}`)
-      .join(" / "),
-    models: latestAssistantTraces,
-    totalLatencyMs:
-      successfulTraces.length > 0
-        ? Math.max(
-            ...successfulTraces.map((item) =>
-              Number(item.totalLatencyMs || 0)
+        setCurrentTrace({
+          model: latestAssistantTraces
+            .map((item) => `${item.provider}: ${item.model}`)
+            .join(" / "),
+          models: latestAssistantTraces,
+          totalLatencyMs:
+            successfulTraces.length > 0
+              ? Math.max(
+                  ...successfulTraces.map((item) =>
+                    Number(item.totalLatencyMs || 0)
+                  )
+                )
+              : undefined,
+          totalTokens: successfulTraces.reduce(
+            (sum, item) => sum + Number(item.totalTokens || 0),
+            0
+          ),
+          costEstimate: successfulTraces
+            .reduce(
+              (sum, item) => sum + Number(item.costEstimate || 0),
+              0
             )
-          )
-        : undefined,
-    totalTokens: successfulTraces.reduce(
-      (sum, item) => sum + Number(item.totalTokens || 0),
-      0
-    ),
-    costEstimate: successfulTraces
-      .reduce((sum, item) => sum + Number(item.costEstimate || 0), 0)
-      .toFixed(6),
-    rag:
-      successfulTraces.find((item) => item.rag)?.rag ||
-      latestAssistantTraces.find((item) => item.rag)?.rag ||
-      null,
-  });
-} else {
-  setCurrentTrace(null);
-}
+            .toFixed(6),
+          rag:
+            successfulTraces.find((item) => item.rag)?.rag ||
+            latestAssistantTraces.find((item) => item.rag)?.rag ||
+            null,
+        });
+      } else {
+        setCurrentTrace(null);
+      }
 
-requestAnimationFrame(scrollToBottom);
+      requestAnimationFrame(scrollToBottom);
     } catch (error) {
       if (error?.code === "request_cancelled") return;
       setErrorState({
         ...toUserError(error, "messages"),
         retryAction: "load-messages",
-        retryPayload: targetConversationId,
+        retryPayload: {
+          conversationId: targetConversationId,
+          prepend,
+          cursor,
+        },
       });
       reportFrontendError(error, {
         event: "frontend_api_failure",
@@ -833,8 +931,24 @@ requestAnimationFrame(scrollToBottom);
       if (messageListRequestRef.current === controller) {
         messageListRequestRef.current = null;
       }
+      if (prepend) setLoadingOlderMessages(false);
     }
   }, [scrollToBottom, token]);
+
+  const loadMoreConversations = useCallback(() => {
+    loadConversations({
+      append: true,
+      cursor: conversationCursor,
+    });
+  }, [conversationCursor, loadConversations]);
+
+  const loadOlderMessages = useCallback(() => {
+    if (!conversationId) return;
+    loadMessages(conversationId, {
+      prepend: true,
+      cursor: messageCursor,
+    });
+  }, [conversationId, loadMessages, messageCursor]);
 
 useEffect(() => {
   if (!authChecking && token && user) {
@@ -854,6 +968,8 @@ useEffect(() => {
     loadMessages(conversationId);
   } else {
     localStorage.removeItem("conversationId");
+    setMessageCursor(null);
+    setMessageHasMore(false);
     setMessages(initialMessages);
     setCurrentTrace(null);
   }
@@ -870,11 +986,20 @@ useEffect(() => {
 
   const startNewChat = () => {
     setConversationId(null);
+    setMessageCursor(null);
+    setMessageHasMore(false);
     setMessages(initialMessages);
     setCurrentTrace(null);
     setErrorState(null);
     localStorage.removeItem("conversationId");
     focusInput();
+  };
+
+  const selectConversation = (nextConversationId) => {
+    if (String(nextConversationId) === String(conversationId)) return;
+    setMessageCursor(null);
+    setMessageHasMore(false);
+    setConversationId(nextConversationId);
   };
 
   const retryLastMessage = () => {
@@ -1182,7 +1307,7 @@ if (successfulAssistantMessages.length === 0) {
   throw error;
 }
 
-setMessages((prev) => [...prev, ...assistantMessages]);
+setMessages((prev) => mergeUniqueMessages(prev, assistantMessages));
 
 setCurrentTrace(
   data?.trace
@@ -1256,12 +1381,27 @@ loadConversations();
     setErrorState(null);
 
     if (action === "load-conversations") {
-      loadConversations();
+      loadConversations(
+        payload
+          ? {
+              append: true,
+              cursor: payload,
+            }
+          : undefined
+      );
       return;
     }
 
     if (action === "load-messages") {
-      loadMessages(payload);
+      loadMessages(
+        payload?.conversationId || conversationId,
+        payload
+          ? {
+              prepend: payload.prepend,
+              cursor: payload.cursor,
+            }
+          : undefined
+      );
       return;
     }
 
@@ -1450,6 +1590,9 @@ loadConversations();
                 sendMessage,
                 chatScrollRef,
                 inputRef,
+                messageHasMore,
+                loadingOlderMessages,
+                loadOlderMessages,
               }}
             />
           </div>
@@ -1458,7 +1601,10 @@ loadConversations();
   currentTrace={currentTrace}
   conversations={conversations}
   conversationId={conversationId}
-  onSelectConversation={setConversationId}
+  onSelectConversation={selectConversation}
+  conversationHasMore={conversationHasMore}
+  loadingMoreConversations={loadingMoreConversations}
+  onLoadMoreConversations={loadMoreConversations}
   nowDate={nowDate}
   nowTime={nowTime}
   weatherText={weatherText}
@@ -1722,6 +1868,21 @@ historyItem: {
   fontWeight: 600,
   background: "#fff",
 },
+  historyMoreButton: {
+    width: "100%",
+    minHeight: 38,
+    borderRadius: 12,
+    border: "1px dashed #93c5fd",
+    background: "#eff6ff",
+    color: "#1d4ed8",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 800,
+  },
+  historyMoreButtonDisabled: {
+    cursor: "not-allowed",
+    opacity: 0.65,
+  },
   historyItemActive: {
     background: "#dbeafe",
     borderColor: "#93c5fd",

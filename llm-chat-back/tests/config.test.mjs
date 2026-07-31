@@ -106,6 +106,9 @@ test("정상 환경설정은 숫자와 목록을 정규화한다", () => {
       SMS_RATE_LIMIT_WINDOW_MS: "120000",
       SPAN_BODY_CAPTURE_MODE: "metadata",
       MONITORING_RUM_SERVICE: "custom-rum-service",
+      CONVERSATION_PAGE_SIZE: "25",
+      MESSAGE_PAGE_SIZE: "60",
+      LLM_HISTORY_MESSAGE_LIMIT: "90",
     })
   );
   assert.deepEqual(issues, []);
@@ -119,4 +122,7 @@ test("정상 환경설정은 숫자와 목록을 정규화한다", () => {
   assert.equal(config.smsRateLimitWindowMs, 120_000);
   assert.equal(config.spanBodyCaptureMode, "metadata");
   assert.equal(config.monitoringRumService, "custom-rum-service");
+  assert.equal(config.conversationPageSize, 25);
+  assert.equal(config.messagePageSize, 60);
+  assert.equal(config.llmHistoryMessageLimit, 90);
 });

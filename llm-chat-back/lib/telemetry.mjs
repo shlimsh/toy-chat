@@ -45,7 +45,11 @@ function setDefinedTags(span, tags) {
 }
 
 function bodyByteLength(body) {
-  return Buffer.byteLength(serializeTelemetry(body), "utf8");
+  const serialized = serializeTelemetry(body);
+
+  return typeof serialized === "string"
+    ? Buffer.byteLength(serialized, "utf8")
+    : 0;
 }
 
 export function buildRequestBodyMetadata(body) {

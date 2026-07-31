@@ -33,6 +33,15 @@ test("기본 Span 본문 메타데이터는 원문 대신 길이와 해시만 �
   assert.doesNotMatch(JSON.stringify(metadata), /Datadog RUM|must-not-leak/);
 });
 
+test("본문이 없는 GET 요청은 body_size 0으로 처리한다", () => {
+  const metadata = buildRequestBodyMetadata(undefined);
+
+  assert.equal(metadata["http.request.body_size"], 0);
+  assert.equal(metadata["app.request.body_field_count"], undefined);
+  assert.equal(metadata["app.request.message_length"], undefined);
+  assert.equal(metadata["app.request.has_conversation_id"], false);
+});
+
 test("응답 메타데이터는 Provider 수와 모델만 보존한다", () => {
   const metadata = buildResponseBodyMetadata({
     status: "success",

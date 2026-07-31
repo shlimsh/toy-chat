@@ -58,6 +58,50 @@ export async function closeDatabase() {
   });
 }
 
+async function ensureIndex({ table, name, columns }) {
+  const rows = await query(
+    `
+    SELECT COUNT(*) AS index_count
+    FROM information_schema.statistics
+    WHERE table_schema = ?
+      AND table_name = ?
+      AND index_name = ?
+    `,
+    [DB_NAME, table, name]
+  );
+
+  if (Number(rows[0]?.index_count || 0) > 0) return false;
+
+  const allowedDefinitions = {
+    idx_conversations_user_updated_id:
+      "ALTER TABLE conversations ADD INDEX idx_conversations_user_updated_id (user_id, updated_at, id)",
+    idx_messages_conversation_id:
+      "ALTER TABLE messages ADD INDEX idx_messages_conversation_id (conversation_id, id)",
+  };
+  const statement = allowedDefinitions[name];
+
+  if (!statement || !Array.isArray(columns) || columns.length === 0) {
+    throw new Error(`Unsupported index definition: ${name}`);
+  }
+
+  try {
+    await query(statement);
+    logger.info("db_index_created", {
+      table,
+      index: name,
+      columns,
+    });
+    return true;
+  } catch (error) {
+    // 여러 서버 인스턴스가 동시에 시작해 같은 인덱스를 생성한 경우에는
+    // 이미 목적이 달성되었으므로 초기화를 계속한다.
+    if (String(error?.code || "").toUpperCase() === "ER_DUP_KEYNAME") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export async function initDatabase() {
   logger.info("db_connect_try", {
     host: DB_HOST,
@@ -87,7 +131,8 @@ export async function initDatabase() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       CONSTRAINT fk_conversations_user
         FOREIGN KEY (user_id) REFERENCES users(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+      INDEX idx_conversations_user_updated_id (user_id, updated_at, id)
     )
   `);
 
@@ -102,9 +147,21 @@ export async function initDatabase() {
       CONSTRAINT fk_messages_conversation
         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
         ON DELETE CASCADE,
-      INDEX idx_messages_conversation_created (conversation_id, created_at)
+      INDEX idx_messages_conversation_created (conversation_id, created_at),
+      INDEX idx_messages_conversation_id (conversation_id, id)
     )
   `);
+
+  await ensureIndex({
+    table: "conversations",
+    name: "idx_conversations_user_updated_id",
+    columns: ["user_id", "updated_at", "id"],
+  });
+  await ensureIndex({
+    table: "messages",
+    name: "idx_messages_conversation_id",
+    columns: ["conversation_id", "id"],
+  });
 
   logger.info("db_initialized", {
     db_host: DB_HOST,

@@ -1,6 +1,10 @@
 import crypto from "crypto";
 import { query } from "../db.mjs";
 import { safeJsonParse } from "../lib/telemetry.mjs";
+import {
+  encodeConversationCursor,
+  toSqlLimit,
+} from "../pagination.mjs";
 
 function generateId(prefix = "id") {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`.slice(0, 64);
@@ -151,7 +155,68 @@ export async function createMessage({
   return mapMessage(rows[0]);
 }
 
-export async function getMessagesByConversationId(conversationId) {
+export async function getConversationPageByUserId({
+  userId,
+  cursor = null,
+  limit,
+  executeQuery = query,
+}) {
+  const safeLimit = toSqlLimit(limit, { min: 1, max: 100 });
+
+  // 대화 목록은 MySQL/MariaDB 버전별 prepared statement 및 LIMIT/Cursor
+  // 처리 차이를 피하기 위해 검증된 단순 조회만 DB에서 수행한다.
+  // toy-chat 규모에서는 사용자별 목록을 정렬해 가져온 뒤 애플리케이션에서
+  // Cursor를 적용하는 편이 호환성과 안정성 측면에서 더 안전하다.
+  const rows = await executeQuery(
+    `
+    SELECT id, user_id, title, created_at, updated_at
+    FROM conversations
+    WHERE user_id = ?
+    ORDER BY updated_at DESC, id DESC
+    `,
+    [userId]
+  );
+
+  const cursorRows = cursor
+    ? rows.filter((row) => {
+        const updatedAt = String(row.updated_at ?? "");
+        const id = String(row.id ?? "");
+
+        return (
+          updatedAt < cursor.updatedAt ||
+          (updatedAt === cursor.updatedAt && id < cursor.id)
+        );
+      })
+    : rows;
+  const conversations = cursorRows.slice(0, safeLimit);
+  const hasMore = cursorRows.length > safeLimit;
+  const last = conversations.at(-1);
+
+  return {
+    conversations,
+    pageInfo: {
+      hasMore,
+      nextCursor:
+        hasMore && last
+          ? encodeConversationCursor({
+              updatedAt: last.updated_at,
+              id: last.id,
+            })
+          : null,
+    },
+  };
+}
+
+export async function getMessagePageByConversationId({
+  conversationId,
+  beforeId = null,
+  limit,
+}) {
+  const safeLimit = toSqlLimit(limit, { min: 1, max: 200 });
+  const fetchLimit = safeLimit + 1;
+  const cursorClause = beforeId ? "AND id < ?" : "";
+  const params = beforeId ? [conversationId, beforeId] : [conversationId];
+
   const rows = await query(
     `
     SELECT
@@ -163,23 +228,55 @@ export async function getMessagesByConversationId(conversationId) {
       created_at
     FROM messages
     WHERE conversation_id = ?
-    ORDER BY created_at ASC, id ASC
+      ${cursorClause}
+    ORDER BY id DESC
+    LIMIT ${fetchLimit}
+    `,
+    params
+  );
+  const hasMore = rows.length > safeLimit;
+  const pageRows = rows.slice(0, safeLimit);
+  const oldest = pageRows.at(-1);
+
+  return {
+    messages: pageRows.reverse().map(mapMessage),
+    pageInfo: {
+      hasMore,
+      nextCursor: hasMore && oldest ? String(oldest.id) : null,
+    },
+  };
+}
+
+export async function getRecentMessagesByConversationId(
+  conversationId,
+  limit
+) {
+  const safeLimit = toSqlLimit(limit, { min: 1, max: 200 });
+  const fetchLimit = Math.min(safeLimit * 2, 400);
+  const rows = await query(
+    `
+    SELECT
+      id,
+      conversation_id,
+      role,
+      content,
+      metadata_json,
+      created_at
+    FROM messages
+    WHERE conversation_id = ?
+    ORDER BY id DESC
+    LIMIT ${fetchLimit}
     `,
     [conversationId]
   );
 
-  return rows.map(mapMessage);
+  return rows
+    .map(mapMessage)
+    .filter((message) => {
+      if (message.role === "user") return true;
+      if (message.role !== "assistant") return false;
+      return String(message.metadata?.status || "success").toLowerCase() !== "failed";
+    })
+    .slice(0, safeLimit)
+    .reverse();
 }
-
-export async function getConversationsByUserId(userId) {
-  return query(
-    `
-    SELECT id, user_id, title, created_at, updated_at
-    FROM conversations
-    WHERE user_id = ?
-    ORDER BY updated_at DESC, created_at DESC
-    `,
-    [userId]
-  );
-}
-

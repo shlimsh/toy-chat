@@ -5,6 +5,8 @@
 
 백엔드가 시작되지 않으면 환경설정 검증 메시지를 먼저 확인한다. JWT_SECRET, MySQL 연결 정보, DD_VERSION과 OpenAI 또는 Azure AI 중 하나 이상의 Provider 설정이 필요하다. OpenAI와 Azure AI를 모두 설정할 필요는 없다.
 
+대화 데이터가 늘어나도 목록과 메시지는 Cursor 단위로 조회된다. 기본값은 대화 20건, 메시지 50건, LLM 문맥 80건이며 CONVERSATION_PAGE_SIZE, MESSAGE_PAGE_SIZE, LLM_HISTORY_MESSAGE_LIMIT 환경변수로 조정할 수 있다. 서버 시작 시 idx_conversations_user_updated_id와 idx_messages_conversation_id 인덱스가 없을 때만 자동 생성한다.
+
 ## Provider 장애
 한 Provider만 실패해도 다른 Provider가 성공하면 HTTP 200과 partial_success를 반환한다. Datadog APM에서 resource_name:"POST /chat" Trace를 열고 llm.provider.request 자식 Span의 error.type, error.message, error.stack을 확인한다. 모든 활성 Provider가 실패하면 AllProvidersFailedError와 HTTP 503이 기록된다.
 

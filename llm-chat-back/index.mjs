@@ -50,7 +50,7 @@ import {
   createConversation,
   createMessage,
   getConversationByIdForUser,
-  getMessagesByConversationId,
+  getMessagesForLlm,
 } from "./services/conversation-service.mjs";
 import {
   markActiveSpanError,
@@ -1190,7 +1190,7 @@ logApiInfo({
               },
             });
 
-            const history = await getMessagesByConversationId(conversation.id);
+            const history = await getMessagesForLlm(conversation.id);
 
             const intent = classifyUserIntent(String(message));
 

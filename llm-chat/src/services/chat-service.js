@@ -9,16 +9,18 @@ function authHeaders(token) {
   };
 }
 
-export function listConversations(token) {
-  return requestJson(`${API_BASE_URL}/conversations`, {
+export function listConversations(token, cursor = null) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return requestJson(`${API_BASE_URL}/conversations${query}`, {
     headers: authHeaders(token),
     timeoutMs: 10000,
   });
 }
 
-export function getConversationMessages(token, conversationId) {
+export function getConversationMessages(token, conversationId, before = null) {
+  const query = before ? `?before=${encodeURIComponent(before)}` : "";
   return requestJson(
-    `${API_BASE_URL}/conversations/${conversationId}/messages`,
+    `${API_BASE_URL}/conversations/${conversationId}/messages${query}`,
     {
       headers: authHeaders(token),
       timeoutMs: 10000,
@@ -41,4 +43,3 @@ export function sendChatMessage(
     timeoutMs: 90000,
   });
 }
-
