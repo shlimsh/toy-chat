@@ -21,6 +21,8 @@ import {
 import { markActiveSpanError } from "../span-utils.mjs";
 
 function normalizeMessage(message) {
+  if (!message) return null;
+
   return {
     ...message,
     status:
@@ -111,7 +113,9 @@ export function createConversationRouter(dependencies = {}) {
         beforeId,
         limit: config.messagePageSize,
       });
-      const messages = result.messages.map(normalizeMessage);
+      const messages = result.messages
+        .map(normalizeMessage)
+        .filter((message) => message !== null);
 
       logger.info("conversation_messages_request_success", {
         user_id: userId,
