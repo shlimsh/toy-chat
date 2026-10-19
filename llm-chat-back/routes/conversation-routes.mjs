@@ -111,7 +111,9 @@ export function createConversationRouter(dependencies = {}) {
         beforeId,
         limit: config.messagePageSize,
       });
-      const messages = result.messages.map(normalizeMessage);
+      const messages = result.messages
+        .filter((message) => message != null)
+        .map(normalizeMessage);
 
       logger.info("conversation_messages_request_success", {
         user_id: userId,
