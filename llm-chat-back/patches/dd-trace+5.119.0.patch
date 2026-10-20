@@ -1,0 +1,78 @@
+diff --git a/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/source-maps.js b/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/source-maps.js
+index 14bdba8..901985d 100644
+--- a/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/source-maps.js
++++ b/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/source-maps.js
+@@ -1,5 +1,6 @@
+ 'use strict'
+ 
++const { fileURLToPath } = require("url");
+ const { join, dirname } = require('path')
+ const { readFileSync } = require('fs')
+ const { readFile } = require('fs/promises')
+@@ -25,7 +26,7 @@ const self = module.exports = {
+   },
+ 
+   async getGeneratedPosition (url, source, line, sourceMapURL) {
+-    const dir = dirname(new URL(url).pathname)
++    const dir = dirname(fileURLToPath(url))
+     return SourceMapConsumer.with(
+       await self.loadSourceMap(dir, sourceMapURL),
+       null,
+@@ -34,7 +35,7 @@ const self = module.exports = {
+   },
+ 
+   async getOriginalPosition (url, line, column, sourceMapURL) {
+-    const dir = dirname(new URL(url).pathname)
++    const dir = dirname(fileURLToPath(url))
+     return SourceMapConsumer.with(
+       await self.loadSourceMap(dir, sourceMapURL),
+       null,
+diff --git a/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/state.js b/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/state.js
+index cc3b897..0138959 100644
+--- a/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/state.js
++++ b/node_modules/dd-trace/packages/dd-trace/src/debugger/devtools_client/state.js
+@@ -1,5 +1,6 @@
+ 'use strict'
+ 
++const { fileURLToPath, pathToFileURL } = require("url");
+ const { join, dirname } = require('path')
+ const { normalize } = require('../../../../../vendor/dist/source-map/lib/util')
+ const { loadSourceMapSync, getOriginalPosition } = require('./source-maps')
+@@ -133,7 +134,7 @@ module.exports = {
+       // the `scriptUrls` map. That might result in this the `scriptUrls.get` call above returning `undefined`, which
+       // will throw when `startsWith` is called on it.
+       let fileName = scriptUrls.get(frame.location.scriptId)
+-      if (fileName.startsWith('file://')) fileName = fileName.slice(7) // TODO: This might not be required
++      if (fileName.startsWith("file:")) fileName = fileURLToPath(fileName) // TODO: This might not be required
+ 
+       let lineNumber = frame.location.lineNumber + 1 // Beware! lineNumber is zero-indexed
+       let columnNumber = (frame.location.columnNumber ?? 0) + 1 // Beware! columnNumber is zero-indexed
+@@ -151,8 +152,8 @@ module.exports = {
+ 
+           if (original.source && original.line !== null) {
+             // Convert source map source path to absolute file path
+-            const dir = dirname(new URL(sourceMapInfo.url).pathname)
+-            fileName = new URL(join(dir, original.source), 'file:').href.slice(7)
++            const dir = dirname(fileURLToPath(sourceMapInfo.url))
++            fileName = join(dir, original.source)
+             lineNumber = original.line
+             columnNumber = original.column ?? columnNumber
+           }
+@@ -196,7 +197,7 @@ session.on('Debugger.scriptParsed', ({ params }) => {
+         url: params.url,
+         sourceMapURL: params.sourceMapURL,
+       })
+-      const dir = dirname(new URL(params.url).pathname)
++      const dir = dirname(fileURLToPath(params.url))
+       let sources
+       try {
+         sources = loadSourceMapSync(dir, params.sourceMapURL).sources
+@@ -214,7 +215,7 @@ session.on('Debugger.scriptParsed', ({ params }) => {
+         loadedScripts.push({
+           ...params,
+           sourceUrl: params.url,
+-          url: new URL(join(dir, source), 'file:').href,
++          url: pathToFileURL(join(dir, source)).href,
+           // The source url provided by V8 unfortunately doesn't always match the source url used internally in the
+           // `source-map` dependency. Both read the same source maps, but the `source-map` dependency iterates over all
+           // the `sources` and normalize them using an internal `normalize` function. If these two strings don't match,

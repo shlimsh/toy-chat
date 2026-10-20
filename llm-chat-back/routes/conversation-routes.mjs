@@ -24,8 +24,8 @@ function normalizeMessage(message) {
   return {
     ...message,
     status:
-      message.metadata?.status ||
-      (message.metadata?.error ? "failed" : undefined),
+message.metadata.status ||
+       (message.metadata?.error ? "failed" : undefined),
     provider: message.metadata?.provider || null,
     model: message.metadata?.model || null,
     error: message.metadata?.error
@@ -112,6 +112,10 @@ export function createConversationRouter(dependencies = {}) {
         limit: config.messagePageSize,
       });
       const messages = result.messages.map(normalizeMessage);
+
+// const messages = result.messages
+//  .filter((message) => message != null)
+//  .map(normalizeMessage);
 
       logger.info("conversation_messages_request_success", {
         user_id: userId,

@@ -10,18 +10,22 @@
     "prestart": "npm run version:sync",
     "start": "node --enable-source-maps --env-file=.env --import dd-trace/initialize.mjs index.mjs",
     "test": "node --test \"tests/**/*.test.mjs\"",
-    "check": "node --check index.mjs"
+    "check": "node --check index.mjs",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "@datadog/datadog-api-client": "^1.58.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
-    "dd-trace": "^5.109.0",
+    "dd-trace": "^5.119.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.20.0",
     "openai": "^6.32.0",
     "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "patch-package": "^8.0.1"
   }
 }
