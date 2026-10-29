@@ -24,7 +24,7 @@ function normalizeMessage(message) {
   return {
     ...message,
     status:
-message.metadata.status ||
+message.metadata?.status ||
        (message.metadata?.error ? "failed" : undefined),
     provider: message.metadata?.provider || null,
     model: message.metadata?.model || null,
